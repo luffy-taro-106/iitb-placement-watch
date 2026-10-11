@@ -1,0 +1,14 @@
+node_modules/
+private/
+.env
+.env.*
+!.env.example
+.clasp.json
+.clasprc*
+**/.auth/
+**/storage-state*.json
+**/*.session.json
+*.log
+screenshots/
+recordings/
+.DS_Store

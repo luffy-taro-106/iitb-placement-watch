@@ -1,0 +1,14 @@
+{
+  "name": "IITB official login setup only",
+  "build": {"dockerfile": "Dockerfile"},
+  "remoteUser": "root",
+  "forwardPorts": [3000,6080],
+  "portsAttributes": {
+    "3000": {"label": "Save IITB login (keep Private)","onAutoForward": "notify"},
+    "6080": {"label": "Official IITB login desktop (keep Private)","onAutoForward": "notify"},
+    "5900": {"onAutoForward": "ignore"}
+  },
+  "otherPortsAttributes": {"onAutoForward": "ignore"},
+  "postCreateCommand": "npm ci",
+  "postStartCommand": "bash .devcontainer/start-desktop.sh"
+}

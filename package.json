@@ -1,0 +1,19 @@
+{
+  "name": "iitb-placement-free-admin-tools",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "One-time official IITB cloud login and manual source verification tools; no production GitHub scheduler.",
+  "scripts": {
+    "login": "node login/server.mjs",
+    "check:source": "node checker/run.mjs",
+    "test": "node --test checker/test/*.test.mjs apps-script/*.test.mjs"
+  },
+  "dependencies": {
+    "playwright": "1.64.0"
+  },
+  "devDependencies": {
+    "linkedom": "0.18.13"
+  },
+  "engines": {"node": ">=22"}
+}
