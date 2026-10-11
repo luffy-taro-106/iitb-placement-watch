@@ -1,5 +1,9 @@
 # One-time official IITB login
 
+For a free one-time setup on your computer, use [the local setup instructions](LOCAL.md) and `npm run login:once`. This uses a fresh temporary browser once; Google Apps Script runs the ongoing monitor. No GitHub Actions or Codespace is required.
+
+The remaining instructions describe the optional older Codespace helper. Do not create a Codespace when billing/free availability is blocked or unverified.
+
 This helper is for a one-time setup and development check. The Codespace does not run the ongoing monitor. Google Apps Script handles scheduled checks after setup.
 
 Create a Codespace only after confirming that its free allowance remains and paid usage is blocked. Keep ports **3000** and **6080** set to **Private**. The helper checks this before opening IITB and again before saving the session.

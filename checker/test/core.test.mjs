@@ -2,11 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {parseHTML} from 'linkedom';
 import {createHmac} from 'node:crypto';
+import {request as httpRequest} from 'node:http';
 import {BLOG,filterSession,listingUrl,normalizePosts,sourceConfig,validIso} from '../policy.mjs';
 import {bridgeCall,bridgeConfig,canonical,signedRequest} from '../bridge.mjs';
 import {capturePage,collectSnapshot,installNetworkPolicy} from '../extract.mjs';
 import {runSourceCheck} from '../run.mjs';
-import {allowedControlOrigin,assertPrivatePorts} from '../../login/server.mjs';
+import {allowedControlOrigin,assertPrivatePorts,startLoginHelper} from '../../login/server.mjs';
 
 const fixtureCookie={name:'fixture_session',value:'not-a-real-cookie',domain:'campus.placements.iitb.ac.in',path:'/',expires:-1,httpOnly:true,secure:true,sameSite:'Lax'};
 const fixtureEnv={IITB_BRIDGE_URL:'https://script.google.com/macros/s/deployment-fixture/exec',IITB_HMAC_SECRET:'fixture-hmac-secret-never-real-0000'};
@@ -130,4 +131,44 @@ test('login control permits only the configured private Codespace origin and ref
   assert.equal(allowedControlOrigin('null',env),false);
   await assertPrivatePorts(env,async(file,args)=>{assert.equal(file,'gh');assert.equal(args.includes('sourcePort,visibility'),true);return {stdout:JSON.stringify([{sourcePort:3000,visibility:'private'},{sourcePort:6080,visibility:'private'}])};});
   await assert.rejects(assertPrivatePorts(env,async()=>({stdout:JSON.stringify([{sourcePort:3000,visibility:'private'},{sourcePort:6080,visibility:'public'}])})),/PRIVATE_PORTS_NOT_VERIFIED/);
+});
+test('one-time local setup launches only after explicit bridge setup and saves only the fresh restricted session',async()=>{
+  const actions=[],launches=[];let closes=0;
+  const page=fixturePage({[BLOG]:article()});
+  const context={route:async()=>{},newPage:async()=>page,storageState:async()=>({cookies:[fixtureCookie,{...fixtureCookie,domain:'other.example'}],origins:[{origin:'https://sso.iitb.ac.in',localStorage:[{name:'fixture-otp',value:'must-not-export'}]}]})};
+  const browser={newContext:async options=>{assert.equal(Object.hasOwn(options,'storageState'),false);assert.equal(Object.hasOwn(options,'userDataDir'),false);return context;},close:async()=>{closes++;}};
+  const helper=await startLoginHelper({env:{},mode:'local',listenPort:0,verifyPorts:async()=>{throw new Error('Local mode must never access GitHub');},browserType:{launch:async options=>{launches.push(options);assert.equal(options.headless,false);assert.equal(Object.hasOwn(options,'channel'),false);assert.equal(Object.hasOwn(options,'executablePath'),false);return browser;}},call:async(config,action,payload)=>{
+    actions.push(action);assert.equal(config.secret,fixtureEnv.IITB_HMAC_SECRET);
+    if(action==='save_session'){assert.equal(payload.source_url,BLOG);assert.deepEqual(payload.session.origins,[]);assert.equal(payload.session.cookies.length,1);assert.deepEqual(Object.keys(payload).sort(),['session','source_url','verified_at']);assert.equal(JSON.stringify(payload).includes('must-not-export'),false);}
+    return {ok:true};
+  }});
+  try {
+    assert.equal(launches.length,0);
+    const origin=new URL(helper.control_url).origin;
+    const html=await (await fetch(helper.control_url)).text(),token=html.match(/name="token" value="([a-f\d]{64})"/)[1];
+    assert.equal(html.includes('name="password"'),false);assert.equal(html.includes('name="otp"'),false);
+    const post=async(path,fields,requestOrigin=origin)=>fetch(helper.control_url+path,{method:'POST',headers:{origin:requestOrigin,'content-type':'application/x-www-form-urlencoded'},body:new URLSearchParams(fields)});
+    const fields={token,bridge_url:fixtureEnv.IITB_BRIDGE_URL,bridge_secret:fixtureEnv.IITB_HMAC_SECRET};
+    assert.equal((await post('configure',fields,'https://evil.example')).status,403);
+    assert.equal((await post('configure',{...fields,password:'forbidden-field'})).status,403);
+    assert.equal((await post('configure',{...fields,token:'0'.repeat(64)})).status,403);
+    const wrongHostStatus=await new Promise((resolve,reject)=>{const request=httpRequest(helper.control_url,{headers:{host:'evil.example'}},response=>{response.resume();resolve(response.statusCode);});request.once('error',reject);request.end();});
+    assert.equal(wrongHostStatus,403);
+    assert.equal(launches.length,0);assert.equal(actions.length,0);
+    const configured=await post('configure',fields);assert.equal(configured.status,200);
+    assert.equal((await configured.text()).includes(fixtureEnv.IITB_HMAC_SECRET),false);assert.equal(launches.length,1);
+    const saved=await post('save-login',{token});assert.equal(saved.status,200);assert.match(await saved.text(),/session was saved/);
+    assert.deepEqual(actions,['status','save_session']);assert.ok(closes>0);
+    assert.equal((await post('save-login',{token})).status,403);
+    assert.equal(allowedControlOrigin('https://fixture-owned-space-3000.app.github.dev',{CODESPACE_NAME:'fixture-owned-space'},'local'),false);
+  } finally {helper.shutdown();}
+});
+test('local setup rejects an unauthenticated bridge before any browser launch',async()=>{
+  let launches=0;
+  const helper=await startLoginHelper({env:{},mode:'local',listenPort:0,browserType:{launch:async()=>{launches++;throw new Error('Must not launch');}},call:async()=>{throw new Error('Fixture bridge rejected');}});
+  try {
+    const origin=new URL(helper.control_url).origin,html=await(await fetch(helper.control_url)).text(),token=html.match(/name="token" value="([a-f\d]{64})"/)[1];
+    const response=await fetch(helper.control_url+'configure',{method:'POST',headers:{origin,'content-type':'application/x-www-form-urlencoded'},body:new URLSearchParams({token,bridge_url:fixtureEnv.IITB_BRIDGE_URL,bridge_secret:fixtureEnv.IITB_HMAC_SECRET})});
+    assert.equal(response.status,400);assert.equal(launches,0);assert.equal((await response.text()).includes(fixtureEnv.IITB_HMAC_SECRET),false);
+  } finally {helper.shutdown();}
 });

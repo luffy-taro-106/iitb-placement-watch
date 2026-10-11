@@ -3,9 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "One-time official IITB cloud login and manual source verification tools; no production GitHub scheduler.",
+  "description": "One-time official IITB login and manual source verification tools; ongoing monitoring runs in Google Apps Script.",
   "scripts": {
     "login": "node login/server.mjs",
+    "login:once": "node login/server.mjs --local",
+    "browser:install": "playwright install chromium",
     "check:source": "node checker/run.mjs",
     "test": "node --test checker/test/*.test.mjs apps-script/*.test.mjs"
   },

@@ -12,7 +12,7 @@ Run `adminSetup()` manually and authorize Google permissions. It verifies accoun
 
 Copy `BRIDGE_SECRET` from these private Script properties into the one-time helper's `IITB_HMAC_SECRET`. Deploy the web app **as yourself**, with access **Anyone**, and use its `/exec` URL as `IITB_BRIDGE_URL`. Public reachability is required for the signed bridge. The harmless `doGet` response is plain text, with no personal data, credential form or HtmlService RPC bridge. Manual setup/install functions additionally check the active owner's identity. Data operations require valid HMAC, fresh timestamp and unused nonce; no Google OAuth token is exposed.
 
-The one-time cloud development login helper visits IITB's official sign-in page. Enter username/password/phone OTP there, select Remember me and save its verified session through the bridge. Cookies stay in private Drive. Shut down the development browser after saving. This component never asks for IITB credentials or OTP on its own page.
+The one-time setup login helper visits IITB's official sign-in page. Enter username/password/phone OTP there, select Remember me and save its verified session through the bridge. Cookies stay in private Drive. The fresh setup browser closes after saving. Ongoing production requires no browser or computer access. This component never asks for IITB credentials or OTP on its own page.
 
 Run `runCheck()` manually to verify direct source access and account identity. The migrated cutoff, sent IDs and meeting IDs remain. Existing posts quietly receive the new fingerprint format. A real new announcement exercises Gmail delivery; a clear future meeting exercises Calendar creation. Fixture tests and trigger creation do not prove provider writes succeeded.
 
