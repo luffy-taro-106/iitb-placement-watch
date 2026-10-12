@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="style.css"><title>Connect IITB Placement Watch</title></head>
+<body>
+  <main>
+    <h1>Use your remembered IITB login</h1>
+    <p>First open the <a href="https://campus.placements.iitb.ac.in/blog/placement/" target="_blank" rel="noopener noreferrer">official placement blog</a> in this same Chrome profile. If IITB shows your remembered account, select it there and wait for the announcements to appear.</p>
+    <p>This one-time connector sends only secure IITB login cookies to your private Google monitor. These cookies can grant access to your IITB account. It does not collect passwords, phone OTPs, saved passwords, or other browsing data.</p>
+    <p>Google must verify the saved session before monitoring can start. IITB may require you to reconnect when the session expires. After successful verification, ongoing checks, email reminders, and calendar updates run on Google.</p>
+    <form id="settings">
+      <label for="bridge">Your private Google monitor URL</label>
+      <input id="bridge" type="url" inputmode="url" autocomplete="off" spellcheck="false" required placeholder="https://script.google.com/macros/s/…/exec">
+      <label for="secret">Private connection key</label>
+      <input id="secret" type="password" autocomplete="off" spellcheck="false" required minlength="32" maxlength="256">
+      <label class="consent"><input id="consent" type="checkbox" required> I want to send this remembered IITB session to my private Google monitor for placement checks.</label>
+      <button id="connect" type="submit" disabled>Connect and save once</button>
+    </form>
+    <p id="result" role="status" aria-live="polite">Preparing the connection page…</p>
+    <p class="small">Chrome asks for access only when you click Connect. The connector removes its permissions after every attempt. You can remove this extension when finished.</p>
+  </main>
+  <iframe id="bridgeTransport" hidden src="google-transport.html" title="Private Google request transport"></iframe>
+  <script type="module" src="ui.mjs"></script>
+</body>
+</html>

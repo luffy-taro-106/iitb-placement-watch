@@ -1,4 +1,4 @@
-/* Read the placement blog using only the session created in the hosted setup browser. */
+/* Read the placement blog using only the explicitly saved restricted IITB session. */
 var PLACEMENT_SOURCE_BLOG_ = 'https://campus.placements.iitb.ac.in/blog/placement/';
 var PLACEMENT_SOURCE_HOSTS_ = ['campus.placements.iitb.ac.in', 'sso.iitb.ac.in'];
 var PLACEMENT_SOURCE_UA_ = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
@@ -7,7 +7,7 @@ var PLACEMENT_SOURCE_MAX_BYTES_ = 1500000;
 var PLACEMENT_SOURCE_TIME_MS_ = 5 * 60 * 1000;
 
 function placementReconnectError_() {
-  return new Error('IITB connection needs reconnection. Sign in again on the official IITB page in the hosted setup browser.');
+  return new Error('IITB connection needs reconnection. Open the official placement blog in your remembered Chrome profile and use the one-time connector.');
 }
 
 function placementByteLength_(value) {
@@ -72,7 +72,7 @@ function placementSessionCookies_(session) {
     if (!cookie || !placementCookieDomain_(cookie.domain) || typeof cookie.name !== 'string' || !/^[!#$%&'*+.^_`|~a-z\d-]{1,256}$/i.test(cookie.name) ||
         typeof cookie.value !== 'string' || cookie.value.length > 4096 || /[\x00-\x20\x7f;,]/.test(cookie.value) ||
         typeof cookie.path !== 'string' || cookie.path.charAt(0) !== '/' || /[\x00-\x20\x7f;]/.test(cookie.path) ||
-        typeof cookie.expires !== 'number' || !isFinite(cookie.expires) || cookie.secure !== true || typeof cookie.httpOnly !== 'boolean') throw new Error('The stored IITB session is not valid. Reconnect in the hosted setup browser.');
+        typeof cookie.expires !== 'number' || !isFinite(cookie.expires) || cookie.secure !== true || typeof cookie.httpOnly !== 'boolean') throw new Error('The stored IITB session is not valid. Reconnect using the one-time Chrome connector.');
     return {name:cookie.name, value:cookie.value, domain:cookie.domain.toLowerCase(), path:cookie.path, expires:cookie.expires,
       secure:cookie.secure, httpOnly:cookie.httpOnly, sameSite:['Strict','Lax','None'].indexOf(cookie.sameSite) === -1 ? 'Lax' : cookie.sameSite};
   }).filter(function(cookie) { return cookie.expires === -1 || cookie.expires > now; });
@@ -120,7 +120,7 @@ function placementSetCookies_(cookies, headers, target) {
       if (cookie.expires === -1 || cookie.expires > Date.now() / 1000) cookies.push(cookie);
     });
   });
-  if (cookies.length > 64) throw new Error('IITB returned too many session cookies. Reconnect in the hosted setup browser.');
+  if (cookies.length > 64) throw new Error('IITB returned too many session cookies. Reconnect using the one-time Chrome connector.');
 }
 
 function placementCheckTime_(startedAt) {
@@ -136,7 +136,7 @@ function placementFetch_(url, cookies, startedAt) {
       'Sec-Fetch-Mode':'navigate', 'Sec-Fetch-Dest':'document'};
     var cookieHeader = placementCookieHeader_(cookies,next);
     var requestIdentity = next.href + '|' + cookieHeader;
-    if (visited[requestIdentity]) throw new Error('IITB sign-in redirects repeated. Reconnect in the hosted setup browser.');
+    if (visited[requestIdentity]) throw new Error('IITB sign-in redirects repeated. Reconnect using the one-time Chrome connector.');
     visited[requestIdentity] = true;
     if (cookieHeader) headers.Cookie = cookieHeader;
     var response;
@@ -146,7 +146,7 @@ function placementFetch_(url, cookies, startedAt) {
     var status = response.getResponseCode(), responseHeaders = response.getAllHeaders();
     placementSetCookies_(cookies,responseHeaders,next);
     if ([301,302,303,307,308].indexOf(status) !== -1) {
-      if (redirects === 12) throw new Error('IITB returned too many sign-in redirects. Reconnect in the hosted setup browser.');
+      if (redirects === 12) throw new Error('IITB returned too many sign-in redirects. Reconnect using the one-time Chrome connector.');
       var location = placementHeader_(responseHeaders,'location');
       if (Array.isArray(location)) location = location[0];
       if (typeof location !== 'string' || !location) throw new Error('IITB returned an incomplete sign-in redirect.');

@@ -9,7 +9,7 @@
     "login:once": "node login/server.mjs --local",
     "browser:install": "playwright install chromium",
     "check:source": "node checker/run.mjs",
-    "test": "node --test checker/test/*.test.mjs apps-script/*.test.mjs"
+    "test": "node --test checker/test/*.test.mjs apps-script/*.test.mjs chrome-connector/test/*.test.mjs"
   },
   "dependencies": {
     "playwright": "1.64.0"

@@ -14,6 +14,13 @@ function validatePosts_(payload) {
 }
 function postFingerprint_(post) { return sha256_(JSON.stringify([post.title,post.text,post.links.map(function(a){return a.url;}).sort()])); }
 function htmlEscape_(value) { return String(value).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
+function comparePublishedPosts_(left,right) {
+  var dateOrder=Date.parse(left.published)-Date.parse(right.published);
+  if(dateOrder)return dateOrder;
+  // WordPress IDs break equal-publication-time ties without losing precision for long digit strings.
+  var leftId=String(left.id).slice(5).replace(/^0+(?=\d)/,''), rightId=String(right.id).slice(5).replace(/^0+(?=\d)/,'');
+  return leftId.length-rightId.length || (leftId<rightId?-1:leftId>rightId?1:0);
+}
 function ingestSnapshot_(payload,configuration) {
   var posts=validatePosts_(payload), state=loadState_();
   if(payload.session) saveSession_(payload.session,payload.observed_at);
@@ -34,18 +41,82 @@ function ingestSnapshot_(payload,configuration) {
   if(attention){state.last_error='calendar_needs_review';saveState_(state);}
   return {ok:true,needs_attention:attention,pending_count:state.pending.length,last_successful_check:state.last_successful_check,delivery_count:state.deliveries.length,meeting_count:Object.keys(state.meetings).length};
 }
-function verifyMail_(message,messageId,recipient) {
+function mailHeaders_(message) {
+  var headers={};((message.payload || {}).headers || []).forEach(function(h){
+    var name=String(h.name).toLowerCase();if(Object.prototype.hasOwnProperty.call(headers,name) && ['to','from','cc','bcc','message-id','x-iitb-placement-delivery'].includes(name))fail_('uncertain_email_delivery');
+    headers[name]=String(h.value).trim();
+  });return headers;
+}
+function ownerMailbox_(value,recipient) {
+  value=String(value || '').trim();
+  var display=value.match(/^(?:"[^"\r\n]*"|[^<>,;\r\n]*)\s*<([^<>\s,;]+)>$/);
+  return (display?display[1]:value).toLowerCase()===recipient.toLowerCase();
+}
+function verifySentOwner_(message,recipient) {
   if(!message || !(message.labelIds || []).includes('SENT'))fail_('uncertain_email_delivery');
-  var headers={};((message.payload || {}).headers || []).forEach(function(h){headers[String(h.name).toLowerCase()]=String(h.value).trim();});
-  if(headers['message-id']!==messageId || (headers.to || '').toLowerCase()!==recipient.toLowerCase())fail_('uncertain_email_delivery');
+  var headers=mailHeaders_(message);
+  if(!ownerMailbox_(headers.to,recipient) || !ownerMailbox_(headers.from,recipient) || headers.cc || headers.bcc)fail_('uncertain_email_delivery');
+  return headers;
+}
+function mailHtml_(message) {
+  var htmlParts=[];
+  function visit(part) {
+    if(!part || typeof part.mimeType!=='string')fail_('uncertain_email_delivery');
+    if(part.mimeType.toLowerCase()==='text/html') {
+      var types=(part.headers || []).filter(function(h){return String(h.name).toLowerCase()==='content-type';});
+      if(types.length!==1 || !/^text\/html\s*;\s*charset\s*=\s*(?:"utf-8"|utf-8)\s*$/i.test(String(types[0].value)) || !part.body)fail_('uncertain_email_delivery');
+      var data=part.body.data,bytes;
+      if(typeof data==='string') {
+        if(data.length>4000000 || !/^[A-Za-z0-9_-]*={0,2}$/.test(data))fail_('uncertain_email_delivery');
+        try {bytes=Utilities.base64DecodeWebSafe(data);}catch(_){fail_('uncertain_email_delivery');}
+      } else if(Array.isArray(data)) {
+        // Advanced Gmail decodes bytes; REST returns a base64url string. Accept neither
+        // arbitrary objects nor sparse/non-integer arrays, and normalize unsigned bytes.
+        if(data.length>3000000)fail_('uncertain_email_delivery');
+        bytes=[];
+        for(var i=0;i<data.length;i++) {
+          if(!Object.prototype.hasOwnProperty.call(data,i) || !Number.isInteger(data[i]) || data[i]<-128 || data[i]>255)fail_('uncertain_email_delivery');
+          bytes.push(data[i]>127?data[i]-256:data[i]);
+        }
+      } else fail_('uncertain_email_delivery');
+      if(bytes.length>3000000)fail_('uncertain_email_delivery');
+      var decoded;try {decoded=Utilities.newBlob(bytes).getDataAsString('UTF-8');}catch(_){fail_('uncertain_email_delivery');}
+      htmlParts.push(decoded);
+    } else if(/^multipart\//i.test(part.mimeType)) (part.parts || []).forEach(visit);
+    else if(part.mimeType.toLowerCase()!=='text/plain')fail_('uncertain_email_delivery');
+  }
+  visit(message.payload);if(htmlParts.length!==1)fail_('uncertain_email_delivery');return htmlParts[0];
+}
+function canonicalMailHtml_(body) {return String(body).replace(/\r\n?/g,'\n').replace(/\n+$/,'');}
+function verifyDeliveryBody_(message,attempt,headers) {
+  if(!attempt || !/^[a-f0-9]{64}$/.test(attempt.body_sha256 || ''))fail_('uncertain_email_delivery');
+  var body=mailHtml_(message);
+  if(sha256_(canonicalMailHtml_(body))!==attempt.body_sha256)fail_('uncertain_email_delivery');
+  if(attempt.delivery_reference && (headers['x-iitb-placement-delivery']!==attempt.delivery_reference || !body.includes('<p>Delivery reference: '+attempt.delivery_reference+'</p>')))fail_('uncertain_email_delivery');
+}
+function verifyMail_(message,messageId,recipient,attempt) {
+  var headers=verifySentOwner_(message,recipient);
+  if(attempt && attempt.delivery_reference)verifyDeliveryBody_(message,attempt,headers);
+  else {
+    // Preserve recovery of messages from the original exact-Message-ID protocol.
+    if(headers['message-id']!==messageId)fail_('uncertain_email_delivery');
+    if(attempt && attempt.body_sha256)verifyDeliveryBody_(message,attempt,headers);
+  }
   return message.id;
 }
-function findSent_(messageId,recipient) {
-  var found=Gmail.Users.Messages.list('me',{q:'in:sent rfc822msgid:'+messageId,maxResults:2});
+function findSent_(messageId,recipient,attempt) {
+  if(attempt && attempt.provider_message_id) {
+    var direct=Gmail.Users.Messages.get('me',attempt.provider_message_id,{format:'full'});
+    if(!direct || direct.id!==attempt.provider_message_id)fail_('uncertain_email_delivery');
+    return verifyMail_(direct,messageId,recipient,attempt);
+  }
+  var query=attempt && attempt.delivery_reference?'in:sent to:'+recipient+' from:'+recipient+' "'+attempt.delivery_reference+'"':'in:sent rfc822msgid:'+messageId;
+  var found=Gmail.Users.Messages.list('me',{q:query,maxResults:2});
   if((found.messages || []).length>1) fail_('uncertain_email_delivery');
   if(!found.messages || !found.messages.length) return null;
-  var verified=Gmail.Users.Messages.get('me',found.messages[0].id,{format:'metadata',metadataHeaders:['Message-ID','To']});
-  return verifyMail_(verified,messageId,recipient);
+  var verified=Gmail.Users.Messages.get('me',found.messages[0].id,{format:'full'});
+  if(!verified || verified.id!==found.messages[0].id)fail_('uncertain_email_delivery');
+  return verifyMail_(verified,messageId,recipient,attempt);
 }
 function acknowledgeEmail_(state,attempt,id) {
   attempt.revisions.forEach(function(revision){
@@ -61,66 +132,134 @@ function acknowledgeEmail_(state,attempt,id) {
   if(!state.deliveries.some(function(d){return d.email_id===id;})) state.deliveries.push({email_id:id,revisions:attempt.revisions,at:new Date().toISOString()});
   state.email_attempt=null;saveState_(state);
 }
+function digestBody_(state,revisions,reference) {
+  if(!Array.isArray(revisions) || !revisions.length)fail_('uncertain_email_delivery');
+  var body='<h2>IITB placement updates</h2>';
+  revisions.forEach(function(revision){
+    var post=state.pending.find(function(p){return p.id===revision.id && p.fingerprint===revision.fingerprint;});
+    if(!post || !['announcement','calendar_recovery'].includes(revision.channel))fail_('uncertain_email_delivery');
+    body+='<h3>'+htmlEscape_(post.title)+'</h3>';
+    if(revision.channel==='announcement')body+='<p>'+htmlEscape_(post.text.slice(0,3000))+'</p>';
+    else body+='<p>The earlier calendar action has now been completed.</p>';
+    body+='<p><a href="'+htmlEscape_(post.url)+'">Placement blog source</a></p>';
+    if(post.calendar_result) body+='<p>'+htmlEscape_(post.calendar_result.message || '')+'</p>';
+    if(post.calendar_result && post.calendar_result.start) body+='<p>Meeting start: '+htmlEscape_(Utilities.formatDate(new Date(post.calendar_result.start),'Asia/Kolkata','dd MMM yyyy, h:mm a'))+' IST.</p>';
+    if(post.links.length) body+='<p>'+post.links.slice(0,25).map(function(link){return '<a href="'+htmlEscape_(link.url)+'">'+htmlEscape_(link.text || link.url)+'</a>';}).join(' · ')+'</p>';
+  });
+  if(reference)body+='<p>Delivery reference: '+reference+'</p>';
+  return body;
+}
+function preserveAttemptBody_(state,attempt) {
+  // Capture the legacy digest before any calendar retry can change its displayed outcome.
+  if(!attempt.body_sha256) {attempt.body_sha256=sha256_(canonicalMailHtml_(digestBody_(state,attempt.revisions,attempt.delivery_reference || null)));saveState_(state);}
+}
+function htmlMailRaw_(recipient,subject,attempt,body) {
+  var headers=['From: '+recipient,'To: '+recipient,'Subject: '+subject,'Message-ID: '+attempt.message_id];
+  if(attempt.delivery_reference)headers.push('X-IITB-Placement-Delivery: '+attempt.delivery_reference);
+  return headers.concat(['MIME-Version: 1.0','Content-Type: text/html; charset=UTF-8','Content-Transfer-Encoding: base64','',''+Utilities.base64Encode(Utilities.newBlob(body).getBytes())]).join('\r\n');
+}
+function pruneDeliveredPending_(state) {
+  state.pending=state.pending.filter(function(post){return !post.notified_email_id || !post.calendar_complete || post.calendar_followup_pending;});saveState_(state);
+}
+function recoverSentPlacementDigest(providerMessageId) {
+  // Manual owner-only repair of a legacy rewritten Message-ID; no send or calendar action occurs.
+  requireOwner_();
+  if(typeof providerMessageId!=='string' || !/^[A-Za-z0-9_-]{1,256}$/.test(providerMessageId))fail_('invalid_request');
+  var lock=LockService.getScriptLock();lock.waitLock(10000);
+  try {
+    var configuration=loadConfiguration_(),state=loadState_(),attempt=state.email_attempt;
+    if(!attempt)fail_('uncertain_email_delivery');
+    // Require the exact pending revisions even when an expected body hash was already saved.
+    digestBody_(state,attempt.revisions,attempt.delivery_reference || null);preserveAttemptBody_(state,attempt);
+    var message=Gmail.Users.Messages.get('me',providerMessageId,{format:'full'});
+    if(!message || message.id!==providerMessageId)fail_('uncertain_email_delivery');
+    var headers=verifySentOwner_(message,configuration.recipient_email);verifyDeliveryBody_(message,attempt,headers);
+    acknowledgeEmail_(state,attempt,providerMessageId);pruneDeliveredPending_(state);
+    return {ok:true,recovered:true,pending_count:state.pending.length};
+  } finally {lock.releaseLock();}
+}
+function calendarWorkResult_(state,configuration,post) {
+  // Backfilled originals must not replace a newer reminder. Later substantive edits to an
+  // existing post remain actionable even when WordPress retains its original publication date.
+  if(post.kind==='new') {
+    var meeting=parseMeeting_(post);
+    if(meeting.kind==='meeting' || meeting.kind==='cancel') {
+      var matched=matchingMeeting_(state,post,meeting);
+      if(matched && (matched.record.source_post_ids || []).some(function(id){
+        return id!==post.id && state.posts[id] && comparePublishedPosts_(Object.assign({id:id},state.posts[id]),post)>0;
+      })) {
+        matched.record.source_post_ids=Array.from(new Set((matched.record.source_post_ids || []).concat([post.id])));
+        if(state.posts[post.id])state.posts[post.id].calendar_event_id=matched.record.event_id;
+        return {kind:'superseded',message:'A newer announcement for this saved meeting already supplies its calendar details; those details were retained.'};
+      }
+    }
+  }
+  return calendarResult_(state,configuration,post);
+}
 function deliverPending_(state,configuration) {
   if(state.email_attempt) {
-    var recovered=findSent_(state.email_attempt.message_id,configuration.recipient_email);
+    preserveAttemptBody_(state,state.email_attempt);
+    var recovered=findSent_(state.email_attempt.message_id,configuration.recipient_email,state.email_attempt);
     if(!recovered) fail_('uncertain_email_delivery');
     acknowledgeEmail_(state,state.email_attempt,recovered);
   }
-  var unfinished=state.pending.filter(function(p){return !p.calendar_complete;});
+  // Listings arrive newest-first. Apply calendar changes oldest-first so final reminders win.
+  var unfinished=state.pending.filter(function(p){return !p.calendar_complete;}).sort(comparePublishedPosts_);
   unfinished.forEach(function(post){
     try {
       var previouslyFailed=post.calendar_complete===false;
-      post.calendar_result=calendarResult_(state,configuration,post);post.calendar_complete=true;
+      post.calendar_result=calendarWorkResult_(state,configuration,post);post.calendar_complete=true;
+      delete post.calendar_followup_pending;
       if(previouslyFailed && post.notified_email_id && ['scheduled','cancelled'].includes(post.calendar_result.kind))post.calendar_followup_pending=true;
     }
-    catch (_) { post.calendar_result={kind:'ambiguous',message:'Calendar scheduling needs review; a provider result may still need verification.'};post.calendar_complete=false; }
+    catch (_) { post.calendar_result={kind:'ambiguous',message:'Calendar scheduling needs review; a provider result may still need verification.'};post.calendar_complete=false;delete post.calendar_followup_pending; }
     saveState_(state);
   });
   var recipients=state.pending.filter(function(p){return !p.notified_email_id || p.calendar_followup_pending;});
   if(recipients.length) {
     var revisions=recipients.map(function(p){return {id:p.id,fingerprint:p.fingerprint,channel:p.notified_email_id?'calendar_recovery':'announcement'};});
     var digestId=sha256_(JSON.stringify(revisions)), messageId='<iitb-placement-'+digestId+'@placement-watch.invalid>';
-    var attempt={message_id:messageId,revisions:revisions,started_at:new Date().toISOString()};
-    var body='<h2>IITB placement updates</h2>';
-    recipients.forEach(function(post){
-      body+='<h3>'+htmlEscape_(post.title)+'</h3>';
-      if(!post.notified_email_id)body+='<p>'+htmlEscape_(post.text.slice(0,3000))+'</p>';
-      else body+='<p>The earlier calendar action has now been completed.</p>';
-      body+='<p><a href="'+htmlEscape_(post.url)+'">Placement blog source</a></p>';
-      if(post.calendar_result) body+='<p>'+htmlEscape_(post.calendar_result.message || '')+'</p>';
-      if(post.calendar_result && post.calendar_result.start) body+='<p>Meeting start: '+htmlEscape_(Utilities.formatDate(new Date(post.calendar_result.start),'Asia/Kolkata','dd MMM yyyy, h:mm a'))+' IST.</p>';
-      if(post.links.length) body+='<p>'+post.links.slice(0,25).map(function(link){return '<a href="'+htmlEscape_(link.url)+'">'+htmlEscape_(link.text || link.url)+'</a>';}).join(' · ')+'</p>';
-    });
+    var reference='IITB-PW-'+digestId;
+    var body=digestBody_(state,revisions,reference),attempt={message_id:messageId,delivery_reference:reference,body_sha256:sha256_(canonicalMailHtml_(body)),revisions:revisions,started_at:new Date().toISOString()};
     var subject='IITB placement: '+recipients.length+' update'+(recipients.length===1?'':'s');
-    var raw=['From: '+configuration.recipient_email,'To: '+configuration.recipient_email,'Subject: '+subject,'Message-ID: '+messageId,'MIME-Version: 1.0','Content-Type: text/html; charset=UTF-8','Content-Transfer-Encoding: base64','',''+Utilities.base64Encode(Utilities.newBlob(body).getBytes())].join('\r\n');
-    var already=findSent_(messageId,configuration.recipient_email);
+    var raw=htmlMailRaw_(configuration.recipient_email,subject,attempt,body);
+    var already=findSent_(messageId,configuration.recipient_email,attempt);
     if(already) acknowledgeEmail_(state,attempt,already);
     else {
       state.email_attempt=attempt;saveState_(state);
-      // A timeout remains uncertain. Future checks search Message-ID; they never blindly resend.
+      // A timeout remains uncertain. Future checks use a saved provider ID or exact body reference.
       var sent=Gmail.Users.Messages.send({raw:Utilities.base64EncodeWebSafe(Utilities.newBlob(raw).getBytes()).replace(/=+$/,'')},'me');
       if(!sent || !sent.id) fail_('uncertain_email_delivery');
-      var verified=Gmail.Users.Messages.get('me',sent.id,{format:'metadata',metadataHeaders:['Message-ID','To']});
-      verifyMail_(verified,messageId,configuration.recipient_email);
+      attempt.provider_message_id=sent.id;saveState_(state);
+      var verified=Gmail.Users.Messages.get('me',sent.id,{format:'full'});
+      if(!verified || verified.id!==sent.id)fail_('uncertain_email_delivery');
+      verifyMail_(verified,messageId,configuration.recipient_email,attempt);
       acknowledgeEmail_(state,attempt,sent.id);
     }
   }
-  state.pending=state.pending.filter(function(post){return !post.notified_email_id || !post.calendar_complete || post.calendar_followup_pending;});saveState_(state);
+  pruneDeliveredPending_(state);
 }
 function notifyFailureOnce_(state,configuration) {
   if(!state.failure) {state.failure={episode:Utilities.getUuid(),attempted:false,notified_email_id:null};saveState_(state);}
   if(state.failure.notified_email_id)return;
   var messageId='<iitb-placement-failure-'+sha256_(state.failure.episode)+'@placement-watch.invalid>';
-  var recovered=findSent_(messageId,configuration.recipient_email);
+  var body;
+  if(!state.failure.attempted && !state.failure.delivery_reference) {
+    state.failure.delivery_reference='IITB-PW-FAIL-'+sha256_(state.failure.episode);
+    body='<p>The IITB placement monitor could not check for updates. Your IITB session may need reconnecting, or the source may be temporarily unavailable. Check the private setup status. This notice is sent once until checks recover.</p><p>Delivery reference: '+state.failure.delivery_reference+'</p>';
+    state.failure.body_sha256=sha256_(canonicalMailHtml_(body));saveState_(state);
+  }
+  var recovered=findSent_(messageId,configuration.recipient_email,state.failure.delivery_reference?state.failure:null);
   if(recovered){state.failure.notified_email_id=recovered;saveState_(state);return;}
   if(state.failure.attempted)return;
   state.failure.attempted=true;saveState_(state);
-  var body='The IITB placement monitor could not check for updates. Your IITB session may need reconnecting, or the source may be temporarily unavailable. Check the private setup status. This notice is sent once until checks recover.';
-  var raw=['From: '+configuration.recipient_email,'To: '+configuration.recipient_email,'Subject: IITB placement monitor needs attention','Message-ID: '+messageId,'MIME-Version: 1.0','Content-Type: text/plain; charset=UTF-8','',''+body].join('\r\n');
+  if(!body)body='<p>The IITB placement monitor could not check for updates. Your IITB session may need reconnecting, or the source may be temporarily unavailable. Check the private setup status. This notice is sent once until checks recover.</p><p>Delivery reference: '+state.failure.delivery_reference+'</p>';
+  var raw=htmlMailRaw_(configuration.recipient_email,'IITB placement monitor needs attention',{message_id:messageId,delivery_reference:state.failure.delivery_reference},body);
   var sent=Gmail.Users.Messages.send({raw:Utilities.base64EncodeWebSafe(Utilities.newBlob(raw).getBytes()).replace(/=+$/,'')},'me');
   if(!sent || !sent.id)return;
-  var verified=Gmail.Users.Messages.get('me',sent.id,{format:'metadata',metadataHeaders:['Message-ID','To']});
-  verifyMail_(verified,messageId,configuration.recipient_email);
+  state.failure.provider_message_id=sent.id;saveState_(state);
+  var verified=Gmail.Users.Messages.get('me',sent.id,{format:'full'});
+  if(!verified || verified.id!==sent.id)fail_('uncertain_email_delivery');
+  verifyMail_(verified,messageId,configuration.recipient_email,state.failure);
   state.failure.notified_email_id=sent.id;saveState_(state);
 }

@@ -1,0 +1,4 @@
+{
+  "bridge_url": "https://script.google.com/macros/s/YOUR_DEPLOYMENT_ID/exec",
+  "hmac_secret": ""
+}

@@ -10,9 +10,9 @@ const propertyData=new Map();
 const properties={getProperty:k=>propertyData.get(k)||null,setProperty(k,v){propertyData.set(k,String(v));return this;},deleteProperty:k=>propertyData.delete(k),getProperties:()=>Object.fromEntries(propertyData),setProperties(o){for(const [k,v] of Object.entries(o))propertyData.set(k,String(v));}};
 let locked=false;
 const lock={tryLock(){if(locked)return false;locked=true;return true;},waitLock(){if(locked)throw new Error('busy');locked=true;},releaseLock(){locked=false;}};
-const blob=value=>({getBytes:()=>[...Buffer.from(String(value))]});
+const blob=value=>{const buffer=Array.isArray(value)?Buffer.from(value.map(v=>(v+256)%256)):Buffer.from(String(value));return {getBytes:()=>[...buffer],getDataAsString:()=>buffer.toString('utf8')};};
 const bytesToBuffer=bytes=>Buffer.from(bytes.map(value=>(value+256)%256));
-const context=vm.createContext({Date:Clock,console,ContentService:{MimeType:{JSON:'json'},createTextOutput:value=>({value,setMimeType(){return this;}})},HtmlService:{createHtmlOutput:value=>value},PropertiesService:{getScriptProperties:()=>properties},LockService:{getScriptLock:()=>lock},Utilities:{DigestAlgorithm:{SHA_256:'sha256'},Charset:{UTF_8:'utf8'},computeDigest:(_,value)=>[...crypto.createHash('sha256').update(value).digest()],computeHmacSha256Signature:(value,key)=>[...crypto.createHmac('sha256',key).update(value).digest()],getUuid:()=>crypto.randomUUID(),newBlob:blob,base64Encode:bytes=>bytesToBuffer(bytes).toString('base64'),base64EncodeWebSafe:bytes=>bytesToBuffer(bytes).toString('base64url'),formatDate:date=>date.toISOString()},ScriptApp:{getProjectTriggers:()=>[],getOAuthToken:()=>{throw new Error('No live Google access allowed in tests');}}});
+const context=vm.createContext({Date:Clock,console,ContentService:{MimeType:{JSON:'json'},createTextOutput:value=>({value,setMimeType(){return this;}})},HtmlService:{createHtmlOutput:value=>value},PropertiesService:{getScriptProperties:()=>properties},LockService:{getScriptLock:()=>lock},Utilities:{DigestAlgorithm:{SHA_256:'sha256'},Charset:{UTF_8:'utf8'},computeDigest:(_,value)=>[...crypto.createHash('sha256').update(value).digest()],computeHmacSha256Signature:(value,key)=>[...crypto.createHmac('sha256',key).update(value).digest()],getUuid:()=>crypto.randomUUID(),newBlob:blob,base64DecodeWebSafe:value=>[...Buffer.from(value,'base64url')],base64Encode:bytes=>bytesToBuffer(bytes).toString('base64'),base64EncodeWebSafe:bytes=>bytesToBuffer(bytes).toString('base64url'),formatDate:date=>date.toISOString()},ScriptApp:{getProjectTriggers:()=>[],getOAuthToken:()=>{throw new Error('No live Google access allowed in tests');}}});
 vm.runInContext(code,context);
 const secret='test-only-shared-secret-with-32-characters';
 properties.setProperty('BRIDGE_SECRET',secret);
@@ -61,8 +61,12 @@ context.saveState_=value=>{state=JSON.parse(JSON.stringify(value));};
 context.loadConfiguration_=()=>config;
 context.loadSession_=()=>null;
 context.saveSession_=()=>{};
-const sentMessages=new Map();let sends=0, unknownSend=false;
-context.Gmail={Users:{Messages:{list(_user,options){const id=options.q.split('rfc822msgid:')[1];return {messages:[...sentMessages].filter(([,message])=>message.messageId===id).map(([id])=>({id}))};},get(_user,id){if(!sentMessages.has(id))throw new Error('404');const message=sentMessages.get(id);return {id,labelIds:['SENT'],payload:{headers:[{name:'Message-ID',value:message.messageId},{name:'To',value:message.to}]}};},send({raw}){sends++;const decoded=Buffer.from(raw,'base64url').toString(),messageId=decoded.match(/Message-ID: ([^\r\n]+)/)[1],to=decoded.match(/To: ([^\r\n]+)/)[1];const id='sent-'+sends;sentMessages.set(id,{messageId,to});if(unknownSend)throw new Error('fixture uncertain send');return {id};}}}};
+const sentMessages=new Map();let sends=0,unknownSend=false,rewriteMessageId=false,failReadback=false;
+context.Gmail={Users:{Messages:{
+  list(_user,options){const messageId=options.q.split('rfc822msgid:')[1],reference=options.q.match(/"(IITB-PW-[A-Z-]*[a-f0-9]{64})"/)?.[1];return {messages:[...sentMessages].filter(([,message])=>reference?message.html.includes(reference) && message.to===config.recipient_email && message.from===config.recipient_email:message.messageId===messageId).map(([id])=>({id}))};},
+  get(_user,id){if(failReadback)throw new Error('fixture readback unavailable');if(!sentMessages.has(id))throw new Error('404');const message=sentMessages.get(id);return {id,labelIds:['SENT'],payload:{mimeType:'text/html',body:{data:Buffer.from(message.html).toString('base64url')},headers:[{name:'Message-ID',value:message.messageId},{name:'To',value:message.to},{name:'From',value:message.from},{name:'Content-Type',value:'text/html; charset=UTF-8'},...(message.reference?[{name:'X-IITB-Placement-Delivery',value:message.reference}]:[])]}};},
+  send({raw}){sends++;const decoded=Buffer.from(raw,'base64url').toString(),requestedMessageId=decoded.match(/Message-ID: ([^\r\n]+)/)[1],to=decoded.match(/To: ([^\r\n]+)/)[1],from=decoded.match(/From: ([^\r\n]+)/)[1],reference=decoded.match(/X-IITB-Placement-Delivery: ([^\r\n]+)/)?.[1],html=Buffer.from(decoded.split('\r\n\r\n')[1],'base64').toString('utf8');const id='sent-'+sends,messageId=rewriteMessageId?'<rewritten-'+sends+'@mail.gmail.com>':requestedMessageId;sentMessages.set(id,{messageId,requestedMessageId,to,from,reference,html});if(unknownSend)throw new Error('fixture uncertain send');return {id};}
+}}};
 const events=new Map();let inserts=0,patches=0;
 context.Calendar={Events:{get(_calendar,id){if(!events.has(id))throw new Error('404 not found');return JSON.parse(JSON.stringify({organizer:{self:true,email:config.recipient_email},...events.get(id)}));},list(){return {items:[]};},insert(event){inserts++;events.set(event.id,JSON.parse(JSON.stringify(event)));return event;},patch(event,_calendar,id){patches++;const result={...events.get(id),...event,id};events.set(id,result);return result;}}};
 const post=(id,title,text)=>({id:'post-'+id,title,text,published:'2026-10-11T16:00:00+05:30',url:context.PLACEMENT_BLOG_+'?p='+id,links:[]});
@@ -183,4 +187,120 @@ assert.equal(sends,beforeUncertainRevisionSends+2,'Recover the old send without 
 assert.equal(state.email_attempt,null);assert.equal(state.pending.length,0);
 assert.ok(state.deliveries.some(delivery=>delivery.revisions?.some(revision=>revision.id===uncertainRevision.id && revision.fingerprint===retainedAttempt.revisions[0].fingerprint)));
 assert.equal(state.deliveries.at(-1).revisions[0].fingerprint,context.postFingerprint_(changedUncertainRevision));
-console.log('Passed: HMAC/expiry/replay, cookie allowlist, partial setup recovery, owner/private migration guards, quiet baseline, duplicate suppression, verified Gmail delivery/recovery, conservative meeting changes, private Calendar ownership/readback, rescheduling and cross-date uncertain-write recovery, calendar followups and one-time source failure notification. Fixtures only; live Google deployment remains unverified.');
+// Newest-first backfill must retain the final reminder details on one occurrence and keep other companies distinct.
+const kearneyTitle='KEARNEY | Pre-Placement Talk (PPT) Set 1 – PPT 5 (1.5)';
+const kearneyOriginal={...post(701,kearneyTitle,'Date: 12 October 2026\nTime: 6:30 PM to 7:30 PM\nJoining link: pending.'),published:'2026-10-11T11:00:00+05:30'};
+const kearneyReminder={...post(703,'Reminder | '+kearneyTitle,'Date: 12 October 2026\nTime: 6:30 PM to 7:30 PM\nThe joining link is now available.'),published:'2026-10-11T13:00:00+05:30',links:[{text:'Join the PPT',url:'https://fixture.webex.com/meet/kearney-fixture'}]};
+const eternal={...post(702,'ETERNAL | Pre-Placement Talk (PPT)','Date: 13 October 2026\nTime: 6:30 PM to 7:30 PM'),published:'2026-10-11T12:00:00+05:30',links:[{text:'Join',url:'https://fixture.webex.com/meet/eternal-fixture'}]};
+assert.equal(context.canonicalTitle_(kearneyOriginal.title),context.canonicalTitle_(kearneyReminder.title));
+const beforeBackfillInserts=inserts,beforeBackfillPatches=patches,beforeBackfillSends=sends;
+context.ingestSnapshot_(snapshot([kearneyReminder,eternal,kearneyOriginal]),config);
+assert.equal(inserts,beforeBackfillInserts+2,'One Kearney occurrence and one distinct Eternal event');assert.equal(patches,beforeBackfillPatches+1);assert.equal(sends,beforeBackfillSends+1);
+const kearneyEvent=[...events.values()].find(event=>event.extendedProperties?.private?.placementSource===kearneyReminder.id);
+assert.ok(kearneyEvent);assert.equal(kearneyEvent.location,kearneyReminder.links[0].url);assert.match(kearneyEvent.description,/joining link is now available/);assert.doesNotMatch(kearneyEvent.description,/Joining link: pending/);
+assert.equal(kearneyEvent.start.dateTime,'2026-10-12T13:00:00.000Z');assert.equal(kearneyEvent.end.dateTime,'2026-10-12T14:00:00.000Z');
+assert.ok([...events.values()].some(event=>event.extendedProperties?.private?.placementSource===eternal.id && event.start.dateTime==='2026-10-13T13:00:00.000Z'));
+context.ingestSnapshot_(snapshot([kearneyReminder,eternal,kearneyOriginal]),config);assert.equal(inserts,beforeBackfillInserts+2);assert.equal(patches,beforeBackfillPatches+1);assert.equal(sends,beforeBackfillSends+1,'Repeat backfill remains quiet');
+// A separately discovered older original is mail-only, while a later edit to that original stays actionable.
+const lateTitle='Fixture company | Pre-Placement Talk (PPT)';
+const knownReminder={...post(711,'Reminder | '+lateTitle,'Date: 14 October 2026\nTime: 6:30 PM to 7:30 PM'),published:'2026-10-11T13:00:00+05:30',links:[{text:'Join',url:'https://fixture.webex.com/meet/final-fixture'}]};
+const lateOriginal={...post(710,lateTitle,'Date: 14 October 2026\nTime: 6:30 PM to 7:30 PM\nJoining link: pending.'),published:'2026-10-11T11:00:00+05:30'};
+context.ingestSnapshot_(snapshot([knownReminder]),config);
+const knownReminderEvent=[...events.values()].find(event=>event.extendedProperties?.private?.placementSource===knownReminder.id),beforeLatePatches=patches,beforeLateInserts=inserts;
+context.ingestSnapshot_(snapshot([lateOriginal]),config);assert.equal(patches,beforeLatePatches,'Late original must not remove final reminder details');assert.equal(inserts,beforeLateInserts);assert.equal(events.get(knownReminderEvent.id).location,knownReminder.links[0].url);
+assert.ok(Object.values(state.meetings).find(record=>record.event_id===knownReminderEvent.id).source_post_ids.includes(lateOriginal.id),'Track the older source identity so its future edits match safely');
+const editedOriginal={...lateOriginal,text:'Date: 15 October 2026\nTime: 7:30 PM to 8:30 PM\nThe organizer has updated this post.',links:[{text:'Updated original link',url:'https://fixture.webex.com/meet/revised-fixture'}]};
+context.ingestSnapshot_(snapshot([editedOriginal]),config);assert.equal(patches,beforeLatePatches+1,'A changed original remains actionable despite its older publication date');assert.equal(inserts,beforeLateInserts);assert.equal(events.get(knownReminderEvent.id).location,editedOriginal.links[0].url);assert.equal(events.get(knownReminderEvent.id).start.dateTime,'2026-10-15T14:00:00.000Z');
+// Superseding a previously mailed failed backfill also clears stale recovery flags.
+const staleTitle='Retry fixture | Pre-Placement Talk (PPT)';
+const staleOriginal={...post(720,staleTitle,'Date: 17 October 2026\nTime: 6:30 PM to 7:30 PM\nJoining link: pending.'),published:'2026-10-11T11:00:00+05:30'};
+context.Calendar.Events.insert=()=>{throw new Error('fixture source event insert failed');};
+assert.equal(context.ingestSnapshot_(snapshot([staleOriginal]),config).needs_attention,true);
+const staleEmail=state.pending.find(p=>p.id===staleOriginal.id).notified_email_id;assert.ok(staleEmail);
+context.Calendar.Events.insert=event=>{
+  if(event.extendedProperties?.private?.placementSource===staleOriginal.id)throw new Error('fixture original remains unavailable');
+  return ordinaryInsert(event);
+};
+const newerRetry={...post(721,'Reminder | '+staleTitle,'Date: 17 October 2026\nTime: 6:30 PM to 7:30 PM'),published:'2026-10-11T13:00:00+05:30',links:[{text:'Final link',url:'https://fixture.webex.com/meet/retry-final-fixture'}]};
+context.ingestSnapshot_(snapshot([newerRetry]),config);
+const pendingRetry=state.pending.find(p=>p.id===staleOriginal.id);
+assert.ok(pendingRetry);assert.equal(pendingRetry.calendar_complete,false);
+pendingRetry.calendar_followup_pending=true;
+context.Calendar.Events.insert=ordinaryInsert;
+const beforeStaleRetrySends=sends,beforeStaleRetryPatches=patches;
+context.ingestSnapshot_(snapshot([staleOriginal]),config);
+assert.equal(patches,beforeStaleRetryPatches);assert.equal(sends,beforeStaleRetrySends,'Do not send obsolete calendar recovery email');assert.equal(state.pending.length,0);assert.ok(state.deliveries.some(delivery=>delivery.email_id===staleEmail));
+// Gmail may rewrite Message-ID. Its returned immutable ID must survive a readback failure.
+rewriteMessageId=true;failReadback=true;
+const rewrittenPost=post(800,'Gmail delivery fixture','The provider may assign its own Message-ID.');
+const beforeRewrittenSends=sends;
+assert.throws(()=>context.ingestSnapshot_(snapshot([rewrittenPost]),config),/fixture readback unavailable/);
+assert.equal(state.email_attempt.provider_message_id,'sent-'+sends,'Persist provider ID before readback');
+assert.match(sentMessages.get(state.email_attempt.provider_message_id).messageId,/@mail\.gmail\.com>/);
+const bodyHashBeforeReadback=state.email_attempt.body_sha256;
+failReadback=false;context.ingestSnapshot_(snapshot([rewrittenPost]),config);
+assert.equal(sends,beforeRewrittenSends+1,'Read back provider ID without duplicate send');assert.equal(state.email_attempt,null);assert.equal(state.pending.length,0);assert.ok(bodyHashBeforeReadback);
+// A timeout without a returned ID recovers by exact body reference, From/To, SENT and content hash.
+unknownSend=true;const timeoutPost=post(801,'Timeout delivery fixture','A sent message can exist after the API response times out.');
+const beforeTimeoutSends=sends;
+assert.throws(()=>context.ingestSnapshot_(snapshot([timeoutPost]),config),/fixture uncertain send/);
+assert.equal(state.email_attempt.provider_message_id,undefined);
+const timeoutId='sent-'+sends,timeoutMessage=sentMessages.get(timeoutId),timeoutAttempt=JSON.parse(JSON.stringify(state.email_attempt));
+assert.equal(timeoutMessage.reference,timeoutAttempt.delivery_reference);assert.match(timeoutMessage.html,/Delivery reference: IITB-PW-/);
+unknownSend=false;
+sentMessages.delete(timeoutId);
+assert.throws(()=>context.deliverPending_(state,config),/uncertain_email_delivery/,'Absent search result remains uncertain');assert.equal(sends,beforeTimeoutSends+1);
+sentMessages.set(timeoutId,timeoutMessage);
+sentMessages.set('duplicate-reference',{...timeoutMessage});
+assert.throws(()=>context.deliverPending_(state,config),/uncertain_email_delivery/,'Multiple exact-reference candidates require review');assert.equal(sends,beforeTimeoutSends+1,'Never resend an uncertain attempt');
+sentMessages.delete('duplicate-reference');
+const markerReadback=context.Gmail.Users.Messages.get('me',timeoutId);
+const markerRemoved=structuredClone(markerReadback);markerRemoved.payload.headers=markerRemoved.payload.headers.filter(header=>header.name!=='X-IITB-Placement-Delivery');
+assert.throws(()=>context.verifyMail_(markerRemoved,timeoutAttempt.message_id,config.recipient_email,timeoutAttempt),/uncertain_email_delivery/);
+const unsupportedCharset=structuredClone(markerReadback);unsupportedCharset.payload.headers.find(header=>header.name==='Content-Type').value='text/html; charset=UTF-16';
+assert.throws(()=>context.verifyMail_(unsupportedCharset,timeoutAttempt.message_id,config.recipient_email,timeoutAttempt),/uncertain_email_delivery/);
+// Advanced Gmail exposes decoded signed bytes; REST exposes base64url text.
+const unicodeHtml='<p>café Δ 日本 🙂</p>',unsignedBytes=[...Buffer.from(unicodeHtml,'utf8')],signedBytes=unsignedBytes.map(value=>value>127?value-256:value);
+const mimeFixture=data=>({payload:{mimeType:'text/html',headers:[{name:'Content-Type',value:'text/html; charset=UTF-8'}],body:{data}}});
+assert.equal(context.mailHtml_(mimeFixture(unsignedBytes)),unicodeHtml);assert.equal(context.mailHtml_(mimeFixture(signedBytes)),unicodeHtml);assert.equal(context.mailHtml_(mimeFixture(Buffer.from(unicodeHtml).toString('base64url'))),unicodeHtml);
+for(const invalid of [[256],[-129],[1.5],[NaN],[Infinity],['65'],[null],[{}],{0:65,length:1},new Array(1),new Array(3000001).fill(65)])assert.throws(()=>context.mailHtml_(mimeFixture(invalid)),/uncertain_email_delivery/);
+const signedMarker=structuredClone(markerReadback);signedMarker.payload.body.data=[...Buffer.from(timeoutMessage.html)].map(value=>value>127?value-256:value);
+assert.equal(context.verifyMail_(signedMarker,timeoutAttempt.message_id,config.recipient_email,timeoutAttempt),timeoutId);
+const unsignedMarker=structuredClone(markerReadback);unsignedMarker.payload.body.data=[...Buffer.from(timeoutMessage.html)];
+assert.equal(context.verifyMail_(unsignedMarker,timeoutAttempt.message_id,config.recipient_email,timeoutAttempt),timeoutId);
+const contentChanged=structuredClone(markerReadback);contentChanged.payload.body.data=Buffer.from(timeoutMessage.html.replace('API response','altered response')).toString('base64url');
+assert.throws(()=>context.verifyMail_(contentChanged,timeoutAttempt.message_id,config.recipient_email,timeoutAttempt),/uncertain_email_delivery/);
+context.ingestSnapshot_(snapshot([timeoutPost]),config);assert.equal(sends,beforeTimeoutSends+1);assert.equal(state.email_attempt,null);
+// Owner-only repair of a legacy rewritten message compares the original entire digest body.
+context.loadConfiguration_=()=>config;
+const legacyRepairPost=post(802,'Legacy delivery fixture','Original details including café and calendar result.');
+const legacyFingerprint=context.postFingerprint_(legacyRepairPost);
+state.posts[legacyRepairPost.id]={...legacyRepairPost,fingerprint:legacyFingerprint};
+state.pending=[{...legacyRepairPost,fingerprint:legacyFingerprint,kind:'new',calendar_complete:true,calendar_result:{kind:'announcement',message:'Original calendar outcome.'}}];
+const legacyRevisions=[{id:legacyRepairPost.id,fingerprint:legacyFingerprint,channel:'announcement'}];
+const legacyRequestedId='<iitb-placement-'+context.sha256_(JSON.stringify(legacyRevisions))+'@placement-watch.invalid>';
+state.email_attempt={message_id:legacyRequestedId,revisions:legacyRevisions,started_at:new Clock().toISOString()};
+const legacyBody=context.digestBody_(state,legacyRevisions,null);
+sentMessages.set('legacy-provider-id',{messageId:'<actual-legacy@mail.gmail.com>',requestedMessageId:legacyRequestedId,to:config.recipient_email,from:config.recipient_email,html:legacyBody.replace(/\n/g,'\r\n')+'\r\n'});
+const beforeManualSends=sends,beforeManualDeliveries=state.deliveries.length;
+context.Session={getActiveUser:()=>({getEmail:()=>''})};
+assert.throws(()=>context.recoverSentPlacementDigest('legacy-provider-id'),/wrong_account/);
+context.Session={getActiveUser:()=>({getEmail:()=>config.recipient_email})};
+sentMessages.set('wrong-legacy-sender',{...sentMessages.get('legacy-provider-id'),from:'other@example.test'});
+assert.throws(()=>context.recoverSentPlacementDigest('wrong-legacy-sender'),/uncertain_email_delivery/);assert.equal(state.deliveries.length,beforeManualDeliveries);
+sentMessages.set('wrong-legacy-body',{...sentMessages.get('legacy-provider-id'),html:legacyBody+'<p>Extra unrelated content.</p>'});
+assert.throws(()=>context.recoverSentPlacementDigest('wrong-legacy-body'),/uncertain_email_delivery/);assert.equal(state.deliveries.length,beforeManualDeliveries);
+const frozenLegacyHash=state.email_attempt.body_sha256;
+state.pending[0].calendar_result.message='A later retry would change this outcome.';
+assert.equal(context.recoverSentPlacementDigest('legacy-provider-id').recovered,true,'Retain the original body hash even if calendar result later changes');
+assert.ok(frozenLegacyHash);assert.equal(state.email_attempt,null);assert.equal(state.pending.length,0);assert.equal(sends,beforeManualSends,'Owner recovery must never send');assert.equal(state.deliveries.length,beforeManualDeliveries+1);assert.equal(state.posts[legacyRepairPost.id].notified_email_id,'legacy-provider-id');
+// Legacy exact-Message-ID verification remains available and still verifies the sender.
+const legacyExact=context.Gmail.Users.Messages.get('me','legacy-provider-id');legacyExact.payload.headers.find(h=>h.name==='Message-ID').value=legacyRequestedId;
+assert.equal(context.verifyMail_(legacyExact,legacyRequestedId,config.recipient_email),'legacy-provider-id');
+legacyExact.payload.headers.find(h=>h.name==='From').value='outside@example.test';assert.throws(()=>context.verifyMail_(legacyExact,legacyRequestedId,config.recipient_email),/uncertain_email_delivery/);
+// Newly created source-failure notices also acknowledge Gmail's generated identifier once.
+state.failure=null;const beforeRewrittenFailureSends=sends;
+context.notifyFailureOnce_(state,config);context.notifyFailureOnce_(state,config);
+assert.equal(sends,beforeRewrittenFailureSends+1);assert.ok(state.failure.notified_email_id);assert.equal(state.failure.provider_message_id,state.failure.notified_email_id);
+rewriteMessageId=false;
+console.log('Passed: HMAC/expiry/replay, cookie allowlist, private setup/migration guards, quiet baseline, duplicate suppression, Gmail-rewritten identifiers, immutable provider-ID persistence, exact-reference timeout recovery, owner-only legacy full-body repair, MIME/From/To/SENT guards, conservative meeting changes, Calendar ownership/readback, rescheduling/backfill/retry recovery, followups and one-time failure notices. Fixtures only; no live provider calls.');

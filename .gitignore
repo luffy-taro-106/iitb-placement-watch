@@ -12,3 +12,5 @@ private/
 screenshots/
 recordings/
 .DS_Store
+**/config.private.json
+**/*.private.json

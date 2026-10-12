@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "IITB Placement Watch — Connect Once",
+  "version": "0.1.0",
+  "description": "Manually send a scoped remembered IITB session to your private Google placement monitor once.",
+  "minimum_chrome_version": "119",
+  "incognito": "not_allowed",
+  "icons": {"16":"icons/blue-16.png","32":"icons/blue-32.png","48":"icons/blue-48.png","128":"icons/blue-128.png"},
+  "action": {
+    "default_title": "Connect IITB Placement Watch",
+    "default_icon": {"16":"icons/blue-16.png","32":"icons/blue-32.png","48":"icons/blue-48.png","128":"icons/blue-128.png"},
+    "default_popup": "popup.html"
+  },
+  "optional_permissions": ["cookies"],
+  "optional_host_permissions": [
+    "https://campus.placements.iitb.ac.in/*",
+    "https://sso.iitb.ac.in/*",
+    "https://script.google.com/*",
+    "https://script.googleusercontent.com/*"
+  ],
+  "content_security_policy": {
+    "extension_pages": "default-src 'self'; script-src 'self'; object-src 'none'; connect-src 'self' https://campus.placements.iitb.ac.in https://sso.iitb.ac.in https://script.google.com https://script.googleusercontent.com; img-src 'none'; frame-src 'self'; form-action 'none'; base-uri 'none'"
+  }
+}
