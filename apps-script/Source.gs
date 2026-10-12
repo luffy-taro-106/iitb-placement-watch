@@ -1,13 +1,31 @@
 /* Read the placement blog using only the explicitly saved restricted IITB session. */
 var PLACEMENT_SOURCE_BLOG_ = 'https://campus.placements.iitb.ac.in/blog/placement/';
+/* The official Placement Blog "Login as" link, observed in the IITB blog chooser. */
+var PLACEMENT_SOURCE_RENEW_ = PLACEMENT_SOURCE_BLOG_ + 'authplacement/';
 var PLACEMENT_SOURCE_HOSTS_ = ['campus.placements.iitb.ac.in', 'sso.iitb.ac.in'];
 var PLACEMENT_SOURCE_UA_ = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
 var PLACEMENT_SOURCE_ACCEPT_ = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8';
 var PLACEMENT_SOURCE_MAX_BYTES_ = 1500000;
 var PLACEMENT_SOURCE_TIME_MS_ = 5 * 60 * 1000;
+var PLACEMENT_SOURCE_TRACE_ = [];
+
+/* Connection diagnostics contain only fixed stage enums, HTTP status and a boolean.
+ * Never store URLs, query parameters, cookie names/values, account names or response bodies.
+ */
+function placementTrace_(target, status, cookiePresent) {
+  var stage = target.host === 'sso.iitb.ac.in' ? 'sso' : target.path === '/blog/placement/authplacement/' ? 'placement_renewal' :
+    target.path === '/blog/placement/' ? 'placement_blog' : target.path === '/' ? 'campus_home' : target.path === '/blog/' ? 'blog_chooser' : 'campus_callback';
+  PLACEMENT_SOURCE_TRACE_.push({stage:stage,status:status,cookie_present:cookiePresent});
+  if (PLACEMENT_SOURCE_TRACE_.length > 32) PLACEMENT_SOURCE_TRACE_.shift();
+  try {
+    if (typeof PropertiesService !== 'undefined') PropertiesService.getScriptProperties().setProperty('SOURCE_CONNECTION_TRACE',JSON.stringify({observed_at:new Date().toISOString(),steps:PLACEMENT_SOURCE_TRACE_}));
+  } catch (_) { /* Optional diagnostics must not interrupt the placement read. */ }
+}
 
 function placementReconnectError_() {
-  return new Error('IITB connection needs reconnection. Open the official placement blog in your remembered Chrome profile and use the one-time connector.');
+  var error = new Error('IITB connection needs reconnection. Open the official placement blog in your remembered Chrome profile and use the one-time connector.');
+  error.placementReconnect = true;
+  return error;
 }
 
 function placementByteLength_(value) {
@@ -56,6 +74,17 @@ function placementHeader_(headers, name) {
   var keys = Object.keys(headers || {});
   for (var i = 0; i < keys.length; i++) if (keys[i].toLowerCase() === name.toLowerCase()) return headers[keys[i]];
   return null;
+}
+
+/* Some official login redirects advertise HTTP. Upgrade the exact supported host
+ * before making any request; cookies/authentication must never travel over HTTP.
+ */
+function placementRedirect_(value, base) {
+  var target = placementUrl_(value,base,false);
+  if (target.protocol === 'http' && PLACEMENT_SOURCE_HOSTS_.indexOf(target.host) !== -1) {
+    return placementUrl_('https://' + target.host + target.path + target.query,null,true);
+  }
+  return placementUrl_(target.href,null,true);
 }
 
 function placementCookieDomain_(domain) {
@@ -131,7 +160,6 @@ function placementFetch_(url, cookies, startedAt) {
   var next = placementUrl_(url, PLACEMENT_SOURCE_BLOG_, true), visited = {};
   for (var redirects = 0; redirects <= 12; redirects++) {
     placementCheckTime_(startedAt);
-    if (next.host === 'sso.iitb.ac.in' && next.path === '/login') throw placementReconnectError_();
     var headers = {'User-Agent':PLACEMENT_SOURCE_UA_, 'Accept':PLACEMENT_SOURCE_ACCEPT_, 'Accept-Language':'en-US,en;q=0.9',
       'Sec-Fetch-Mode':'navigate', 'Sec-Fetch-Dest':'document'};
     var cookieHeader = placementCookieHeader_(cookies,next);
@@ -144,13 +172,23 @@ function placementFetch_(url, cookies, startedAt) {
     catch (error) { throw new Error('IITB could not be reached. Previous posts and successful-check time were preserved.'); }
     placementCheckTime_(startedAt);
     var status = response.getResponseCode(), responseHeaders = response.getAllHeaders();
+    placementTrace_(next,status,!!cookieHeader);
     placementSetCookies_(cookies,responseHeaders,next);
     if ([301,302,303,307,308].indexOf(status) !== -1) {
       if (redirects === 12) throw new Error('IITB returned too many sign-in redirects. Reconnect using the one-time Chrome connector.');
       var location = placementHeader_(responseHeaders,'location');
       if (Array.isArray(location)) location = location[0];
       if (typeof location !== 'string' || !location) throw new Error('IITB returned an incomplete sign-in redirect.');
-      next = placementUrl_(location,next.href,true);
+      /* Record the rejected destination class without its host, path or query. */
+      try {placementRedirect_(location,next.href);} catch (error) {
+        var reason = /^http:\/\/(campus\.placements\.iitb\.ac\.in|sso\.iitb\.ac\.in)(?:[/?#]|$)/i.test(location) ? 'http_redirect' : 'unsupported_redirect';
+        PLACEMENT_SOURCE_TRACE_.push({stage:reason,status:status,cookie_present:false});
+        try {
+          if (typeof PropertiesService !== 'undefined') PropertiesService.getScriptProperties().setProperty('SOURCE_CONNECTION_TRACE',JSON.stringify({observed_at:new Date().toISOString(),steps:PLACEMENT_SOURCE_TRACE_.slice(-32)}));
+        } catch (_) {}
+        throw error;
+      }
+      next = placementRedirect_(location,next.href);
       continue;
     }
     if (status === 401 || status === 403 || next.host !== 'campus.placements.iitb.ac.in' || next.path !== '/blog/placement/') throw placementReconnectError_();
@@ -225,17 +263,37 @@ function parsePlacementListing_(html, url) {
   return {posts:posts,next:next};
 }
 
+/* Renew the shorter placement session through the existing remembered IITB session.
+ * This is one bounded GET flow, never a credential form, script or account switch.
+ * Persist its replacement cookies only after every requested source page succeeds.
+ */
+function placementReadListing_(url, cookies, startedAt, renewal) {
+  try {
+    var response = placementFetch_(url,cookies,startedAt);
+    return parsePlacementListing_(response.text,response.url);
+  } catch (error) {
+    if (!error.placementReconnect || renewal.attempted) throw error;
+    renewal.attempted = true;
+    var refreshed = placementFetch_(PLACEMENT_SOURCE_RENEW_,cookies,startedAt);
+    var listing = parsePlacementListing_(refreshed.text,refreshed.url);
+    if (url === PLACEMENT_SOURCE_BLOG_ && refreshed.url === PLACEMENT_SOURCE_BLOG_) return listing;
+    var retried = placementFetch_(url,cookies,startedAt);
+    return parsePlacementListing_(retried.text,retried.url);
+  }
+}
+
 function readPlacementSource_() {
+  PLACEMENT_SOURCE_TRACE_ = [];
   var startedAt = Date.now(), session = loadSession_(), cookies = placementSessionCookies_(session);
   var priorTime = getLastPlacementCheck_(), priorMilliseconds = priorTime ? Date.parse(priorTime) : NaN;
   var threshold = startedAt - 30 * 24 * 60 * 60 * 1000;
   if (isFinite(priorMilliseconds)) threshold = Math.min(threshold,priorMilliseconds);
-  var posts = [], ids = {}, pages = {}, url = PLACEMENT_SOURCE_BLOG_;
+  var posts = [], ids = {}, pages = {}, url = PLACEMENT_SOURCE_BLOG_, renewal = {attempted:false};
   for (var page = 0; url && page < 25; page++) {
     placementCheckTime_(startedAt);
     if (pages[url]) throw new Error('Placement pagination repeated. Previous posts and successful-check time were preserved.');
     pages[url] = true;
-    var response = placementFetch_(url,cookies,startedAt), listing = parsePlacementListing_(response.text,response.url), oldest = Infinity;
+    var listing = placementReadListing_(url,cookies,startedAt,renewal), oldest = Infinity;
     listing.posts.forEach(function(post) {
       if (ids[post.id]) throw new Error('A placement post repeated across pages. Previous posts were preserved.');
       ids[post.id] = true; posts.push(post); oldest = Math.min(oldest,Date.parse(post.published));

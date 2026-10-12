@@ -4,6 +4,7 @@ import vm from 'node:vm';
 
 const source = await readFile(new URL('./Source.gs',import.meta.url),'utf8');
 const BLOG='https://campus.placements.iitb.ac.in/blog/placement/';
+const RENEW=BLOG+'authplacement/';
 const CAMPUS='campus.placements.iitb.ac.in', SSO='sso.iitb.ac.in';
 const NOW=Date.parse('2026-10-11T06:00:00Z');
 const plain = value => JSON.parse(JSON.stringify(value));
@@ -113,14 +114,91 @@ function harness({session={cookies:[cookie('campus'),cookie('sso',SSO)],origins:
   assert.equal(h.session.cookies[0].value,'fixture-campus');
 }
 
-// Stop before requesting the login screen; never submit credentials, CAPTCHA or OTP.
+// A credential screen is only read via GET; never submit it or loop on its login redirect.
 {
-  const h=harness({fetch:()=>response('',302,{Location:'https://'+SSO+'/login?next=fixture'})});
-  assert.throws(()=>h.run(),/reconnection/);assert.equal(h.requests.length,1);assert.equal(h.saved.length,0);
+  const login='https://'+SSO+'/login?next=fixture';
+  const h=harness({fetch:url=>url===login?response('<form method="post"><input name="password"></form>'):response('',302,{Location:login})});
+  assert.throws(()=>h.run(),/reconnection/);assert.deepEqual(h.requests.map(r=>r.url),[BLOG,login,RENEW,login]);assert.equal(h.saved.length,0);
+  assert.ok(h.requests.every(r=>r.options.method==='get'));
 }
 
-// Cross-origin redirects, insecure destinations and URL credentials cannot produce requests.
-for (const destination of ['https://evil.example/blog/placement/','http://'+CAMPUS+'/blog/placement/','https://user:pass@'+SSO+'/authorize','https://'+CAMPUS+'.evil.example/blog/placement/','https://127.0.0.1/blog/placement/']) {
+// Remembered SSO can answer its login entry point with a redirect instead of a credential form.
+{
+  const login='https://'+SSO+'/login?next=fixture';
+  const callback=RENEW+'?code=fixture';
+  let blogReads=0;
+  const h=harness({fetch(url,options) {
+    if (url===BLOG && ++blogReads===1) return response('',302,{Location:login});
+    if (url===login) {assert.equal(options.headers.Cookie,'sso=fixture-sso');return response('',302,{Location:callback,'Set-Cookie':'sso=renewed; Path=/; Secure; HttpOnly'});}
+    if (url===callback) return response('',302,{Location:BLOG,'Set-Cookie':'campus=renewed; Path=/; Secure; HttpOnly'});
+    assert.equal(url,BLOG);return response(article(1));
+  }});
+  assert.equal(h.run().posts.length,1);assert.equal(h.saved.length,1);assert.equal(h.requests.length,4);
+}
+
+// An expired placement session can land on the public campus page while SSO remembers us.
+{
+  const auth='https://'+SSO+'/authorize?client_id=placement&state=fixture';
+  const campus='https://'+CAMPUS+'/';
+  let reads=0;
+  const h=harness({fetch(url,options) {
+    assert.equal(options.method,'get');
+    if (url===BLOG && ++reads===1) return response('',302,{Location:campus});
+    if (url===campus) return response('<a href="/blog/">Student</a>');
+    if (url===RENEW) return response('',302,{Location:auth});
+    if (url===auth) {
+      assert.equal(options.headers.Cookie,'sso=fixture-sso');
+      return response('',302,{Location:RENEW+'?code=fixture','Set-Cookie':'sso=renewed; Path=/; Secure; HttpOnly'});
+    }
+    if (url===RENEW+'?code=fixture') return response('',302,{Location:BLOG,'Set-Cookie':'campus=renewed; Path=/; Secure; HttpOnly'});
+    if (url===BLOG) return response(article(1)+next(2));
+    assert.equal(url,BLOG+'?paged=2');
+    assert.equal(options.headers.Cookie,'campus=renewed');
+    return response(article(2,'2026-08-01T00:00:00Z'));
+  }});
+  assert.equal(h.run().posts.length,2);
+  assert.equal(h.saved.length,1);
+  assert.equal(h.saved[0].session.cookies.find(c=>c.name==='campus').value,'renewed');
+  assert.equal(h.saved[0].session.cookies.find(c=>c.name==='sso').value,'renewed');
+  assert.equal(h.requests.filter(r=>r.url===RENEW).length,1);
+}
+
+// A mid-pagination expiry renews once, then retries the exact requested page.
+{
+  let secondPageReads=0;
+  const h=harness({fetch(url) {
+    if (url===BLOG) return response(article(1)+next(2));
+    if (url===BLOG+'?paged=2') return ++secondPageReads===1?response('',401):response(article(2,'2026-08-01T00:00:00Z'));
+    assert.equal(url,RENEW);return response('',302,{Location:BLOG,'Set-Cookie':'campus=renewed; Path=/; Secure; HttpOnly'});
+  }});
+  assert.deepEqual(plain(h.run().posts.map(p=>p.id)),['post-1','post-2']);
+  assert.equal(secondPageReads,2);assert.equal(h.saved.length,1);
+}
+
+// Rejected remembered access is bounded and cannot save a partial renewal or loop.
+{
+  const h=harness({fetch:url=>response('',403,{'Set-Cookie':'campus=unverified; Path=/; Secure; HttpOnly'})});
+  assert.throws(()=>h.run(),/reconnection/);
+  assert.deepEqual(h.requests.map(r=>r.url),[BLOG,RENEW]);
+  assert.equal(h.saved.length,0);
+  assert.equal(h.session.cookies[0].value,'fixture-campus');
+}
+
+// Official HTTP canonical redirects are upgraded before sending cookies; no HTTP request occurs.
+{
+  let first=true;
+  const h=harness({fetch(url) {
+    assert.match(url,/^https:\/\//);
+    if (first) {first=false;return response('',302,{Location:'http://'+CAMPUS+'/blog/placement/authplacement'});}
+    if (url==='https://'+CAMPUS+'/blog/placement/authplacement') return response('',302,{Location:BLOG,'Set-Cookie':'campus=renewed; Path=/; Secure; HttpOnly'});
+    assert.equal(url,BLOG);return response(article(1));
+  }});
+  assert.equal(h.run().posts.length,1);assert.equal(h.saved.length,1);assert.equal(h.requests.length,3);
+  assert.ok(h.requests.every(r=>r.url.startsWith('https://')));
+}
+
+// Cross-origin redirects, unsupported ports and URL credentials cannot produce requests.
+for (const destination of ['https://evil.example/blog/placement/','http://evil.example/blog/placement/','http://'+CAMPUS+':81/blog/placement/','https://user:pass@'+SSO+'/authorize','https://'+CAMPUS+'.evil.example/blog/placement/','https://127.0.0.1/blog/placement/']) {
   const h=harness({fetch:()=>response('',302,{location:destination})});
   assert.throws(()=>h.run(),/unsupported|outside/);assert.equal(h.requests.length,1);assert.equal(h.saved.length,0);
 }

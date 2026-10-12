@@ -79,6 +79,24 @@ test('Only the allowlisted valid fresh HMAC can reach activation identity or sou
   const valid=h.envelope('status');assert.equal(h.post(valid).ok,true);assert.equal(h.post(valid).error,'replayed_request');
 });
 
+test('Connection diagnostics require authenticated ownership and reveal only bounded stage metadata',()=>{
+  const h=harness();
+  h.properties.set('SOURCE_CONNECTION_TRACE',JSON.stringify({observed_at:new Date(NOW).toISOString(),secret:'never-return',steps:[
+    {stage:'placement_renewal',status:302,cookie_present:true,url:'https://example.test/?code=never-return',cookies:'never-return'},
+    {stage:'sso',status:200,cookie_present:false},
+    {stage:'https://secret.example.test',status:200,cookie_present:true}
+  ]}));
+  const forged=h.envelope('connection_diagnostics');forged.signature='0'.repeat(64);
+  assert.equal(h.post(forged).error,'authentication_failed');
+  assert.equal(h.call('connection_diagnostics',{url:'https://example.test'}).error,'invalid_payload');
+  const result=h.call('connection_diagnostics');
+  assert.deepEqual(result,{ok:true,observed_at:new Date(NOW).toISOString(),steps:[{stage:'placement_renewal',status:302,cookie_present:true},{stage:'sso',status:200,cookie_present:false}]});
+  assert.doesNotMatch(JSON.stringify(result),/never-return|secret/);
+  assert.equal(h.stats().sourceReads,0);assert.equal(h.stats().created,0);
+  const wrong=harness({effectiveOwner:'other@example.test'});
+  assert.equal(wrong.call('connection_diagnostics').error,'wrong_account');
+});
+
 test('Signed activation verifies the execution owner; manual active-owner requirement stays intact',()=>{
   for(const effectiveOwner of ['', 'other@example.test']) {
     const h=harness({effectiveOwner});assert.equal(h.call('install_monitor').error,'wrong_account');assert.equal(h.stats().sourceReads,0);assert.equal(h.triggers.length,0);

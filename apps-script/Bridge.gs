@@ -24,7 +24,7 @@ function validInstant_(value, recent) {
 }
 function verifyEnvelope_(body, properties, nowSeconds) {
   requireObject_(body);
-  if (!['get_session', 'save_session', 'ingest_snapshot', 'status', 'install_monitor'].includes(body.action) || !/^[a-f0-9]{32}$/.test(body.nonce || '') || !Number.isSafeInteger(body.issued_at)) fail_('invalid_request');
+  if (!['get_session', 'save_session', 'ingest_snapshot', 'status', 'install_monitor', 'connection_diagnostics'].includes(body.action) || !/^[a-f0-9]{32}$/.test(body.nonce || '') || !Number.isSafeInteger(body.issued_at)) fail_('invalid_request');
   if (nowSeconds - body.issued_at > 300 || body.issued_at - nowSeconds > 60) fail_('expired_request');
   requireObject_(body.payload);
   var secret = properties.getProperty('BRIDGE_SECRET');
@@ -59,6 +59,11 @@ function doPost(e) {
       return jsonOutput_({ok:true, connected:true});
     }
     if (request.action === 'status') return jsonOutput_(status_(configuration));
+    if (request.action === 'connection_diagnostics') {
+      if (Object.keys(request.payload).length) fail_('invalid_payload');
+      requireExecutionOwner_(configuration);
+      return jsonOutput_(connectionDiagnostics_(properties));
+    }
     if (request.action === 'install_monitor') {
       if (Object.keys(request.payload).length) fail_('invalid_payload');
       // The verified HMAC authorizes the caller. Effective user identifies only this deployment.
@@ -74,6 +79,16 @@ function doPost(e) {
 function doGet() {
   // ContentService deliberately supplies no HtmlService google.script.run RPC surface.
   return ContentService.createTextOutput('Placement Watch\nThis endpoint accepts signed requests only. Setup is managed privately by its owner in Google Apps Script.\nEnter IITB credentials and phone OTP only on IITB\u2019s official sign-in page. This service has no login form.').setMimeType(ContentService.MimeType.TEXT);
+}
+
+function connectionDiagnostics_(properties) {
+  var trace;
+  try {trace=JSON.parse(properties.getProperty('SOURCE_CONNECTION_TRACE') || 'null');} catch (_) {trace=null;}
+  if (!trace || typeof trace.observed_at !== 'string' || !isFinite(Date.parse(trace.observed_at)) || !Array.isArray(trace.steps)) return {ok:true,observed_at:null,steps:[]};
+  var stages=['sso','placement_renewal','placement_blog','campus_home','blog_chooser','campus_callback','http_redirect','unsupported_redirect'];
+  var steps=trace.steps.slice(-32).filter(function(step) {return step && stages.includes(step.stage) && Number.isInteger(step.status) && step.status>=100 && step.status<=599 && typeof step.cookie_present==='boolean';})
+    .map(function(step) {return {stage:step.stage,status:step.status,cookie_present:step.cookie_present};});
+  return {ok:true,observed_at:new Date(trace.observed_at).toISOString(),steps:steps};
 }
 
 function googleIdentity_() {
