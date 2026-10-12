@@ -12,11 +12,11 @@ Run `adminSetup()` manually and authorize Google permissions. It verifies accoun
 
 Copy `BRIDGE_SECRET` from these private Script properties into the one-time helper's `IITB_HMAC_SECRET`. Deploy the web app **as yourself**, with access **Anyone**, and use its `/exec` URL as `IITB_BRIDGE_URL`. Public reachability is required for the signed bridge. The harmless `doGet` response is plain text, with no personal data, credential form or HtmlService RPC bridge. Manual setup/install functions additionally check the active owner's identity. Data operations require valid HMAC, fresh timestamp and unused nonce; no Google OAuth token is exposed.
 
-The one-time Chrome connector reuses the profile where the user has already signed in on IITB's official page. The user installs it and explicitly approves a restricted Secure-cookie transfer to this private bridge. It never reads passwords, OTPs, profile files or cached HTTP authentication credentials. A saved session is a candidate until Google obtains the real source with it. Exact-host Chrome permissions may omit shared parent-domain cookies. Remove the connector after use. Once cloud access is verified, ongoing production requires no browser or computer. The isolated login helper remains an alternative.
+The one-time Chrome connector reuses the profile where the user has already signed in on IITB's official page. The user installs it and explicitly approves a restricted Secure-cookie transfer to this private bridge. It never reads passwords, OTPs, profile files or cached HTTP authentication credentials. After saving this candidate session, it sends signed `install_monitor` to perform a real cloud source check and enable the 30-minute schedule. Exact-host Chrome permissions may omit shared parent-domain cookies. Remove the connector after its activation confirmation. Once cloud access is verified, ongoing production requires no browser or computer. The isolated login helper remains an alternative.
 
 Run `runCheck()` manually to verify direct source access and account identity. The migrated cutoff, sent IDs and meeting IDs remain. Existing posts quietly receive the new fingerprint format. A real new announcement exercises Gmail delivery; a clear future meeting exercises Calendar creation. Fixture tests and trigger creation do not prove provider writes succeeded.
 
-When that check succeeds without unfinished calendar work, run `installMonitor()`. It rechecks access, then creates one installable `runCheck` trigger with `everyMinutes(30)`. Existing triggers are reused; multiple matching triggers cause an error. Google controls trigger timing, so this is an approximately 30-minute cadence. Session expiry, revoked Google access, quotas and outages can require attention.
+The Chrome connector performs activation automatically after the session transfer. The manual alternative is `installMonitor()`. Both use the same locked implementation: a fresh complete source check must succeed without unresolved delivery work before one installable `runCheck` trigger with `everyMinutes(30)` is created. Only a matching trigger with recorded fixed-cadence metadata is reused; unknown or multiple matching triggers cause an error. Google controls trigger timing, so this is an approximately 30-minute cadence. Session expiry, revoked Google access, quotas and outages can require attention.
 
 ## Signed protocol
 
@@ -28,8 +28,11 @@ Nonces are consumed before the action and persist for 10 minutes; retries need n
 | --- | --- | --- |
 | `get_session` | `{}` | `{ok:true,session:storageStateOrNull,last_successful_check:ISOOrNull}` |
 | `save_session` | `{source_url,session,verified_at}` | `{ok:true,connected:true}` |
+| `install_monitor` | `{}` | Fresh cloud source check, healthy delivery and exactly one fixed 30-minute trigger; returns sanitized activation metadata |
 | `ingest_snapshot` | `{source_url,posts,complete:true,observed_at,session?}` | `{ok:true,needs_attention,pending_count,last_successful_check,delivery_count,meeting_count}` |
 | `status` | `{}` | Counts, timestamps, session presence/expiry, trigger presence and attention; no cookies or announcement content |
+
+`install_monitor` is administrative access available only after HMAC validation, replay protection, account/private-file checks and verification of the deployment's effective Google identity. An effective owner identity is not caller authentication; the HMAC gate remains mandatory. Manual setup functions retain their active-owner guard. Status separates `cloud_source_verified_at` from a browser session timestamp or manually ingested snapshot, and `monitor_interval_minutes` is populated only for a recorded matching trigger.
 
 `source_url` must equal the IITB placement blog URL. Sessions use Playwright `storageState`: `cookies` and empty `origins`. Only Secure cookies for exact campus/SSO hosts (optional leading dot) and shared **`.iitb.ac.in`** are accepted. Bare `iitb.ac.in`, other domains and localStorage are rejected. Non-expired cookies do not prove IITB still accepts them.
 

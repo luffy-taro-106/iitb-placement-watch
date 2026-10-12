@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {createHmac,webcrypto} from 'node:crypto';
 import {readFile} from 'node:fs/promises';
 import {DOMParser} from 'linkedom';
-import {BLOG,SSO_COOKIE_URL,PERMISSIONS,ConnectorError,validateConfig,canonical,signedRequest,bridgeCall,verifyBlog,toSession,connect,revokePermissions} from '../core.mjs';
+import {BLOG,SSO_COOKIE_URL,PERMISSIONS,GOOGLE_PERMISSIONS,ConnectorError,validateConfig,canonical,signedRequest,bridgeCall,validateBridgeResult,verifyBlog,toSession,connect,checkActivation,revokePermissions} from '../core.mjs';
 import {validTransportRequest,googleFetch} from '../google-fetch.mjs';
 
 const NOW=Date.parse('2026-10-12T12:00:00Z');
@@ -22,12 +22,22 @@ function cookie(extra={}) {
     secure:true,session:true,sameSite:'lax',storeId:'0',...extra};
 }
 function groups(campus=[],sso=[]) {return [{url:BLOG,cookies:campus},{url:SSO_COOKIE_URL,cookies:sso}];}
-function fixture({grant=true,bridgeOk=true,blogOk=true,rows=[cookie()],revoke=true,saveOk=true,incognito=false}={}) {
-  const events=[],bodies=[],raw=[];let active=false;
+function statusReply({installed=false,connected=true,proof=null,...extra}={}) {
+  return {ok:true,connected,session_status:connected?'cloud_verified':'missing',session_verified_at:connected?new Date(NOW).toISOString():null,
+    last_successful_check:proof,last_error:null,post_count:0,pending_count:0,meeting_count:0,delivery_count:0,
+    monitor_installed:installed,needs_attention:false,cloud_source_verified_at:proof,last_cloud_source_check:proof,
+    interval_minutes:installed?30:null,monitor_interval_minutes:installed?30:null,...extra};
+}
+function installReply(extra={}) {
+  return {ok:true,installed:true,interval_minutes:30,cloud_source_verified_at:new Date(NOW).toISOString(),last_cloud_source_check:new Date(NOW).toISOString(),...extra};
+}
+function fixture({grant=true,bridgeOk=true,blogOk=true,rows=[cookie()],revoke=true,saveOk=true,incognito=false,installResult=null,installLost=false,saveLost=false,statusReplies=null}={}) {
+  const events=[],bodies=[],raw=[];let active=false,requested=PERMISSIONS,saved=false,installed=false,statusIndex=0,elapsed=0;
   const chromeImpl={extension:{inIncognitoContext:incognito},permissions:{
-    request:async request=>{events.push('permissions');assert.deepEqual(request,{permissions:['cookies'],origins:[...PERMISSIONS.origins]});active=grant;return grant;},
+    request:async request=>{events.push(request.permissions.length?'permissions':'google-permissions');requested=request;
+      assert.deepEqual(request,request.permissions.length?{permissions:['cookies'],origins:[...PERMISSIONS.origins]}:{permissions:[],origins:[...GOOGLE_PERMISSIONS.origins]});active=grant;return grant;},
     remove:async()=>{events.push('revoke');if(revoke)active=false;return revoke;},
-    getAll:async()=>({permissions:active?['cookies']:[],origins:active?[...PERMISSIONS.origins]:[]})
+    getAll:async()=>({permissions:active?[...requested.permissions]:[],origins:active?[...requested.origins]:[]})
   },cookies:{getAll:async details=>{
     assert.deepEqual(details,{url:details.url,secure:true});assert.ok([BLOG,SSO_COOKIE_URL].includes(details.url));
     events.push(details.url===BLOG?'campus-cookies':'sso-cookies');
@@ -39,9 +49,20 @@ function fixture({grant=true,bridgeOk=true,blogOk=true,rows=[cookie()],revoke=tr
     assert.equal(url,BRIDGE_URL);assert.equal(options.credentials,'omit');
     const body=JSON.parse(options.body);bodies.push(body);events.push(body.action);
     assert.equal(body.signature,createHmac('sha256',KEY).update(canonical(body.action,body.nonce,body.issued_at,body.payload)).digest('hex'));
-    return response(JSON.stringify({ok:body.action==='status'?bridgeOk:saveOk,private_metadata:'not returned to UI'}));
+    if(body.action==='status') {
+      const result=!bridgeOk?{ok:false,error:'authentication_failed'}:statusReplies?statusReplies[Math.min(statusIndex,statusReplies.length-1)]:statusReply({installed,connected:saved,proof:installed?new Date(NOW).toISOString():null});
+      statusIndex++;if(result.error==='busy')elapsed+=Math.min(options.timeoutMs,10000);return response(JSON.stringify(result));
+    }
+    if(body.action==='save_session') {
+      saved=saveOk;
+      if(saveLost)throw new Error('synthetic save response lost');
+      return response(JSON.stringify(saveOk?{ok:true,connected:true}:{ok:false,error:'operation_failed'}));
+    }
+    assert.equal(body.action,'install_monitor');assert.deepEqual(body.payload,{});installed=true;
+    if(installLost){elapsed+=options.timeoutMs;throw new Error('synthetic installation response lost');}
+    return response(JSON.stringify(installResult || installReply()));
   };
-  return {events,bodies,raw,deps:{chromeImpl,fetchImpl,cryptoImpl:webcrypto,now:()=>NOW,parseHtml}};
+  return {events,bodies,raw,deps:{chromeImpl,fetchImpl,cryptoImpl:webcrypto,now:()=>NOW,parseHtml,monotonicNow:()=>elapsed,waitImpl:async ms=>{elapsed+=ms;}},elapsed:()=>elapsed};
 }
 
 test('HMAC envelope matches the deployed canonical protocol and URL validation rejects arbitrary destinations',async()=>{
@@ -88,12 +109,13 @@ test('blog gate requires a fresh fixed-URL HTML 200 containing parsed announceme
   assert.deepEqual(await verifyBlog({fetchImpl:async()=>response(HTML,{url:BLOG,type:'text/html'}),parseHtml}),{verified:true});
 });
 
-test('Connect grants from the gesture, verifies private bridge then blog before cookie reads, saves only a candidate, and revokes',async()=>{
+test('Connect verifies missing-session backend status then blog, saves once before install, confirms real cloud activation, and revokes',async()=>{
   const f=fixture(),input=config();const pending=connect(input,f.deps);
   assert.deepEqual(f.events,['permissions']);
   const result=await pending;
-  assert.deepEqual(f.events,['permissions','status','blog','campus-cookies','sso-cookies','save_session','revoke']);
-  assert.deepEqual(result,{saved:true,source_verified_in_chrome:true,cloud_verified:false,cookie_count:1,permissions_revoked:true});
+  assert.deepEqual(f.events,['permissions','status','blog','campus-cookies','sso-cookies','save_session','install_monitor','revoke']);
+  assert.deepEqual(result,{saved:true,source_verified_in_chrome:true,activated:true,cloud_verified:true,interval_minutes:30,
+    cloud_source_verified_at:new Date(NOW).toISOString(),cookie_count:1,permissions_revoked:true});
   assert.deepEqual(Object.keys(f.bodies[1].payload),['source_url','session','verified_at']);
   assert.equal(f.bodies[1].payload.source_url,BLOG);assert.deepEqual(f.bodies[1].payload.session.origins,[]);
   assert.equal(input.hmac_secret,'');assert.ok(f.raw.every(item=>item.value===''));
@@ -121,7 +143,87 @@ test('bridge replies require authenticated success and expected Google final res
     {text:'{"ok":true}',url:'https://evil.invalid/macros/echo'}, {text:'{"ok":true}',url:'https://script.googleusercontent.com/unexpected'},
     {text:'x'.repeat(1500001)}
   ]) await assert.rejects(bridgeCall(config(),'status',{}, {...common,fetchImpl:async()=>response(item.text,{url:item.url||RESULT_URL})}),error=>error instanceof ConnectorError&&!error.message.includes('private provider'));
-  assert.deepEqual(await bridgeCall(config(),'status',{}, {...common,fetchImpl:async()=>response('{"ok":true,"email":"synthetic@example.invalid"}')}),{ok:true});
+  await assert.rejects(bridgeCall(config(),'status',{}, {...common,fetchImpl:async()=>response(JSON.stringify({...statusReply(),email:'synthetic@example.invalid'}))}),error=>error.code==='BRIDGE_INVALID_RESPONSE');
+  const missing=statusReply({connected:false});
+  assert.deepEqual(await bridgeCall(config(),'status',{}, {...common,fetchImpl:async()=>response(JSON.stringify(missing))}),
+    {ok:true,monitor_installed:false,monitor_interval_minutes:null,connected:false,healthy:false,needs_attention:false,last_error:null,session_verified_at:null,cloud_source_verified_at:null});
+});
+
+test('known cloud source or schedule failures never report activated and permit a deliberate reconnect retry',async()=>{
+  for(const [error,code] of [['source_connection_required','CLOUD_SOURCE_UNAVAILABLE'],['monitor_verification_required','MONITOR_CONFIGURATION_REQUIRED'],['delivery_needs_review','DELIVERY_REVIEW_REQUIRED']]) {
+    const f=fixture({installResult:{ok:false,error}});
+    await assert.rejects(connect(config(),f.deps),result=>result.code===code&&!Object.hasOwn(result,'activationNotBefore'));
+    assert.equal(f.events.at(-1),'revoke');assert.equal(f.bodies.filter(body=>body.action==='install_monitor').length,1);
+    assert.ok(f.raw.every(row=>row.value===''));
+  }
+});
+
+test('uncertain install is established by fresh healthy signed status without resaving cookies or repeating installation',async()=>{
+  const f=fixture({installLost:true});const result=await connect(config(),f.deps);
+  assert.equal(result.activated,true);assert.equal(result.cloud_verified,true);
+  assert.equal(f.bodies.filter(body=>body.action==='save_session').length,1);assert.equal(f.bodies.filter(body=>body.action==='install_monitor').length,1);
+  assert.equal(f.bodies.filter(body=>body.action==='status').length,2);assert.equal(f.events.at(-1),'revoke');assert.ok(f.elapsed()<=90000);
+});
+
+test('busy installation remains explicitly uncertain and all recovery requests fit the 90-second activation window',async()=>{
+  const f=fixture({installLost:true,statusReplies:[statusReply({connected:false}),{ok:false,error:'busy'}]});
+  await assert.rejects(connect(config(),f.deps),error=>error.code==='ACTIVATION_UNCONFIRMED'&&error.activationNotBefore===new Date(NOW).toISOString());
+  assert.ok(f.elapsed()<=90000);assert.equal(f.events.at(-1),'revoke');
+  assert.equal(f.bodies.filter(body=>body.action==='install_monitor').length,1);
+  assert.equal(f.bodies.filter(body=>body.action==='save_session').length,1);
+});
+
+test('malformed lost install result falls through strictly validated status without trusting unknown metadata',async()=>{
+  const f=fixture({installResult:{...installReply(),session:{cookies:['synthetic']}}});
+  assert.throws(()=>validateBridgeResult('install_monitor',{...installReply(),session:{}},NOW),error=>error.code==='BRIDGE_INVALID_RESPONSE');
+  const result=await connect(config(),f.deps);assert.equal(result.activated,true);
+  assert.equal(f.bodies.filter(body=>body.action==='install_monitor').length,1);
+  assert.equal(f.bodies.filter(body=>body.action==='status').length,2);
+});
+
+test('recovery refuses old proof, future proof, expired session, attention and source/calendar/delivery errors',async()=>{
+  const fresh=new Date(NOW).toISOString(),old=new Date(NOW-300000).toISOString();
+  for(const status of [
+    statusReply({installed:true,proof:old}),statusReply({installed:true,proof:fresh,connected:false,session_status:'expired'}),
+    statusReply({installed:true,proof:fresh,needs_attention:true}),statusReply({installed:true,proof:fresh,last_error:'source_check_failed'}),
+    statusReply({installed:true,proof:fresh,last_error:'calendar_needs_review',needs_attention:true}),
+    statusReply({installed:true,proof:fresh,last_error:'delivery_needs_review',needs_attention:true}),
+    statusReply({installed:true,proof:new Date(NOW+61000).toISOString()})
+  ]) {
+    const f=fixture({installLost:true,statusReplies:[statusReply({connected:false}),status]});
+    await assert.rejects(connect(config(),f.deps),ConnectorError);assert.equal(f.events.at(-1),'revoke');assert.ok(f.elapsed()<=90000);
+  }
+  const pending=fixture({installLost:true,statusReplies:[statusReply({connected:false}),statusReply()]});
+  await assert.rejects(connect(config(),pending.deps),error=>error.code==='ACTIVATION_UNCONFIRMED'&&error.activationNotBefore===fresh);
+  assert.equal(pending.bodies.filter(body=>body.action==='save_session').length,1);
+});
+
+test('Check activation asks for Google-only permissions, loads private configuration after gesture and only polls status',async()=>{
+  const f=fixture({statusReplies:[statusReply({installed:true,proof:new Date(NOW).toISOString()})]});
+  const pending=checkActivation(async()=>{assert.deepEqual(f.events,['google-permissions']);return config();},{...f.deps,notBefore:new Date(NOW).toISOString()});
+  assert.deepEqual(f.events,['google-permissions']);
+  assert.deepEqual(await pending,{activated:true,cloud_verified:true,interval_minutes:30,cloud_source_verified_at:new Date(NOW).toISOString(),permissions_revoked:true});
+  assert.deepEqual(f.events,['google-permissions','status','revoke']);assert.equal(f.raw.length,0);
+  assert.deepEqual(f.bodies.map(body=>body.action),['status']);
+});
+
+test('small status schema rejects unknown/session data, arbitrary errors and inconsistent intervals',()=>{
+  for(const bad of [
+    {extra:'unknown'}, {session:{}}, {last_error:'raw provider private error'}, {connected:'true'},
+    {needs_attention:null}, {monitor_interval_minutes:15}, {interval_minutes:15}, {post_count:-1}
+  ]) assert.throws(()=>validateBridgeResult('status',{...statusReply(),...bad},NOW),error=>error.code==='BRIDGE_INVALID_RESPONSE');
+  const unhealthy=validateBridgeResult('status',statusReply({installed:true,proof:new Date(NOW).toISOString(),last_error:'calendar_needs_review',needs_attention:true}),NOW);
+  assert.equal(unhealthy.healthy,false);assert.equal(unhealthy.last_error,'calendar_needs_review');
+  assert.equal(Object.hasOwn(unhealthy,'post_count'),false);
+});
+
+test('a lost save response can be confirmed by exact signed storage timestamp, with no blind save retransmission',async()=>{
+  const f=fixture({saveLost:true});assert.equal((await connect(config(),f.deps)).activated,true);
+  assert.deepEqual(f.events,['permissions','status','blog','campus-cookies','sso-cookies','save_session','status','install_monitor','revoke']);
+  assert.equal(f.bodies.filter(body=>body.action==='save_session').length,1);
+  const unknown=fixture({saveLost:true,statusReplies:[statusReply({connected:false}),statusReply({connected:false})]});
+  await assert.rejects(connect(config(),unknown.deps),error=>error.code==='SESSION_SAVE_UNCONFIRMED');
+  assert.equal(unknown.events.includes('install_monitor'),false);assert.equal(unknown.events.at(-1),'revoke');
 });
 
 test('Google-only transport validates signed envelopes, omits Chrome credentials, and rejects arbitrary requests',async()=>{

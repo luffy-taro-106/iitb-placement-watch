@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "IITB Placement Watch — Connect Once",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Manually send a scoped remembered IITB session to your private Google placement monitor once.",
   "minimum_chrome_version": "119",
   "incognito": "not_allowed",

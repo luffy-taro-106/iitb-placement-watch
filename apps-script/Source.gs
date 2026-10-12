@@ -248,6 +248,6 @@ function readPlacementSource_() {
   var observedAt = new Date(Date.now()).toISOString();
   var snapshot = {source_url:PLACEMENT_SOURCE_BLOG_,observed_at:observedAt,complete:true,posts:posts};
   if (placementByteLength_(JSON.stringify(snapshot)) > PLACEMENT_SOURCE_MAX_BYTES_) throw new Error('The placement snapshot exceeded its supported size. Previous posts were preserved.');
-  saveSession_({cookies:cookies,origins:[]},observedAt);
+  saveCloudSession_({cookies:cookies,origins:[]},observedAt);
   return snapshot;
 }

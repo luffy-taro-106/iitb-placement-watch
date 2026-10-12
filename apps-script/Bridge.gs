@@ -24,7 +24,7 @@ function validInstant_(value, recent) {
 }
 function verifyEnvelope_(body, properties, nowSeconds) {
   requireObject_(body);
-  if (!['get_session', 'save_session', 'ingest_snapshot', 'status'].includes(body.action) || !/^[a-f0-9]{32}$/.test(body.nonce || '') || !Number.isSafeInteger(body.issued_at)) fail_('invalid_request');
+  if (!['get_session', 'save_session', 'ingest_snapshot', 'status', 'install_monitor'].includes(body.action) || !/^[a-f0-9]{32}$/.test(body.nonce || '') || !Number.isSafeInteger(body.issued_at)) fail_('invalid_request');
   if (nowSeconds - body.issued_at > 300 || body.issued_at - nowSeconds > 60) fail_('expired_request');
   requireObject_(body.payload);
   var secret = properties.getProperty('BRIDGE_SECRET');
@@ -58,10 +58,16 @@ function doPost(e) {
       saveSession_(request.payload.session, validInstant_(request.payload.verified_at, true));
       return jsonOutput_({ok:true, connected:true});
     }
-    if (request.action === 'status') return jsonOutput_(status_());
+    if (request.action === 'status') return jsonOutput_(status_(configuration));
+    if (request.action === 'install_monitor') {
+      if (Object.keys(request.payload).length) fail_('invalid_payload');
+      // The verified HMAC authorizes the caller. Effective user identifies only this deployment.
+      requireExecutionOwner_(configuration);
+      return jsonOutput_(installMonitorUnlocked_(configuration));
+    }
     return jsonOutput_(ingestSnapshot_(request.payload, configuration));
   } catch (error) {
-    var allowed = ['busy','invalid_request','invalid_payload','expired_request','replayed_request','authentication_failed','setup_required','invalid_source','invalid_session','invalid_timestamp','stale_snapshot','invalid_snapshot','wrong_account','private_storage_required','uncertain_email_delivery','calendar_review_required','source_connection_required'];
+    var allowed = ['busy','invalid_request','invalid_payload','expired_request','replayed_request','authentication_failed','setup_required','invalid_source','invalid_session','invalid_timestamp','stale_snapshot','invalid_snapshot','wrong_account','private_storage_required','uncertain_email_delivery','calendar_review_required','source_connection_required','delivery_needs_review','duplicate_monitor_triggers','monitor_verification_required'];
     return jsonOutput_({ok:false, error:allowed.includes(error.message) ? error.message : 'operation_failed'});
   } finally { lock.releaseLock(); }
 }
@@ -78,6 +84,10 @@ function googleIdentity_() {
 function requireOwner_() {
   var active=Session.getActiveUser().getEmail();
   if(!active || active.toLowerCase()!==googleIdentity_())fail_('wrong_account');
+}
+function requireExecutionOwner_(configuration) {
+  var effective=Session.getEffectiveUser().getEmail();
+  if (!effective || effective.toLowerCase()!==configuration.recipient_email.toLowerCase()) fail_('wrong_account');
 }
 function assertPrivateFile_(id, owner) {
   var file = Drive.Files.get(id, {fields:'id,driveId,owners(emailAddress),shared'});
@@ -133,7 +143,17 @@ function validateSession_(session) {
   return {cookies:cookies, origins:[]};
 }
 function saveSession_(session, verifiedAt) {
-  privateWrite_('SESSION_FILE_ID', {session:validateSession_(session), verified_at:verifiedAt || new Date().toISOString()});
+  // Browser transfer/manual ingestion is not evidence of access from Google's servers.
+  privateWrite_('SESSION_FILE_ID', {session:validateSession_(session), verified_at:verifiedAt || new Date().toISOString(), cloud_source_verification:null});
+}
+function saveCloudSession_(session, verifiedAt) {
+  // Called only after the official source reader has completed every required page.
+  validInstant_(verifiedAt,true);
+  privateWrite_('SESSION_FILE_ID', {session:validateSession_(session), verified_at:verifiedAt, cloud_source_verification:{source_url:PLACEMENT_BLOG_,complete:true,observed_at:verifiedAt,verifier:'apps_script_https'}});
+}
+function cloudSourceVerifiedAt_(stored) {
+  var proof=stored && stored.cloud_source_verification;
+  return proof && proof.source_url===PLACEMENT_BLOG_ && proof.complete===true && proof.verifier==='apps_script_https' && typeof proof.observed_at==='string' && isFinite(Date.parse(proof.observed_at)) ? proof.observed_at : null;
 }
 function adminSetup() {
   requireOwner_();
@@ -162,11 +182,17 @@ function adminSetup() {
     return {ok:true, initialized:true, secret_property:'BRIDGE_SECRET'};
   } finally { lock.releaseLock(); }
 }
-function status_() {
-  var state=loadState_(), session=loadSession_();
-  var triggers=ScriptApp.getProjectTriggers().filter(function (t) {return t.getHandlerFunction()==='runCheck';});
-  var stored=privateRead_('SESSION_FILE_ID');
-  return {ok:true,connected:sessionConnected_(session),session_status:!session?'missing':sessionConnected_(session)?'saved_not_live_verified':'expired',session_verified_at:stored.verified_at || null,last_successful_check:state.last_successful_check || null,last_error:state.last_error || null,post_count:Object.keys(state.posts).length,pending_count:state.pending.length,meeting_count:Object.keys(state.meetings).length,delivery_count:state.deliveries.length,monitor_installed:triggers.length===1,needs_attention:!!state.email_attempt || !!state.last_error || state.pending.some(function(p){return p.calendar_complete===false;})};
+function inspectMonitor_(configuration) {
+  var triggers=ScriptApp.getProjectTriggers().filter(function(t){return t.getHandlerFunction()==='runCheck';}), installation=null;
+  try { installation=JSON.parse(PropertiesService.getScriptProperties().getProperty('MONITOR_INSTALLATION_JSON')); } catch (_) {}
+  var known=triggers.length===1 && installation && installation.version===1 && installation.handler==='runCheck' && installation.interval_minutes===30 && installation.owner===configuration.recipient_email.toLowerCase() && typeof installation.trigger_id==='string' && installation.trigger_id===triggers[0].getUniqueId() && triggers[0].getEventType()===ScriptApp.EventType.CLOCK && triggers[0].getTriggerSource()===ScriptApp.TriggerSource.CLOCK;
+  return {triggers:triggers,installed:!!known,error:triggers.length>1?'duplicate_monitor_triggers':triggers.length===1 && !known?'monitor_verification_required':null};
+}
+function status_(configuration) {
+  var state=loadState_(),stored=privateRead_('SESSION_FILE_ID'),session=stored.session || null;
+  var monitor=inspectMonitor_(configuration || loadConfiguration_()),connected=sessionConnected_(session),proof=cloudSourceVerifiedAt_(stored);
+  var error=state.last_error ? ['source_check_failed','delivery_needs_review','calendar_needs_review','operation_failed'].includes(state.last_error)?state.last_error:'operation_failed' : null;
+  return {ok:true,connected:connected,session_status:!session?'missing':!connected?'expired':proof && error!=='source_check_failed'?'cloud_verified':'saved_not_live_verified',session_verified_at:stored.verified_at || null,cloud_source_verified_at:proof,last_cloud_source_check:proof,last_successful_check:state.last_successful_check || null,last_error:error,post_count:Object.keys(state.posts).length,pending_count:state.pending.length,meeting_count:Object.keys(state.meetings).length,delivery_count:state.deliveries.length,monitor_installed:monitor.installed,interval_minutes:monitor.installed?30:null,monitor_interval_minutes:monitor.installed?30:null,needs_attention:!!state.email_attempt || !!error || !!monitor.error || state.pending.some(function(p){return p.calendar_complete===false;})};
 }
 function runCheck() {
   var lock=LockService.getScriptLock(); if (!lock.tryLock(1000)) return {ok:false,error:'busy'};
@@ -188,7 +214,7 @@ function runCheckUnlocked_() {
         if(phase==='source') notifyFailureOnce_(state,configuration);
       } catch (_) {}
     }
-    return {ok:false,error:'check_failed'};
+    return {ok:false,error:'check_failed',failure_phase:phase};
   }
 }
 function migrationState_(migration,configuration) {
@@ -213,13 +239,45 @@ function migrationState_(migration,configuration) {
 }
 function installMonitor() {
   requireOwner_();
-  // Run manually after OAuth/session setup; a saved trigger is not a successful delivery.
   var lock=LockService.getScriptLock();lock.waitLock(10000);
-  try {
-    var result=runCheckUnlocked_(); if (!result.ok || result.needs_attention) fail_('source_connection_required');
-    var triggers=ScriptApp.getProjectTriggers().filter(function (t) {return t.getHandlerFunction()==='runCheck';});
-    if (!triggers.length) ScriptApp.newTrigger('runCheck').timeBased().everyMinutes(30).create();
-    else if (triggers.length>1) fail_('duplicate_monitor_triggers');
-    return {ok:true,installed:true,interval_minutes:30,last_successful_check:result.last_successful_check};
-  } finally {lock.releaseLock();}
+  try {return installMonitorUnlocked_(loadConfiguration_());} finally {lock.releaseLock();}
+}
+function installMonitorUnlocked_(configuration) {
+  // Both callers already hold ScriptLock; never acquire it again here or in the source reader.
+  var monitor=inspectMonitor_(configuration);
+  if(monitor.error) fail_(monitor.error);
+  var verificationStartedAt=Date.now(),result=runCheckUnlocked_();
+  if(!result.ok) {
+    if(result.failure_phase==='account') fail_('operation_failed');
+    var failure=loadState_().last_error;
+    if(failure==='source_check_failed') fail_('source_connection_required');
+    if(['delivery_needs_review','calendar_needs_review'].includes(failure)) fail_('delivery_needs_review');
+    fail_('operation_failed');
+  }
+  var checked=status_(configuration);
+  if(result.needs_attention || checked.needs_attention) fail_('delivery_needs_review');
+  if(!checked.connected || !checked.cloud_source_verified_at || Date.parse(checked.cloud_source_verified_at)<verificationStartedAt || Math.abs(Date.now()-Date.parse(checked.cloud_source_verified_at))>10*60000) fail_('source_connection_required');
+  // Refuse an unrecognized schedule rather than guessing its interval from its handler name.
+  monitor=inspectMonitor_(configuration);
+  if(monitor.error) fail_(monitor.error);
+  if(!monitor.installed) {
+    var trigger=null,properties=PropertiesService.getScriptProperties();
+    try {
+      trigger=ScriptApp.newTrigger('runCheck').timeBased().everyMinutes(30).create();
+      properties.setProperty('MONITOR_INSTALLATION_JSON',JSON.stringify({version:1,trigger_id:trigger.getUniqueId(),handler:'runCheck',interval_minutes:30,owner:configuration.recipient_email.toLowerCase()}));
+      if(!inspectMonitor_(configuration).installed) fail_('monitor_verification_required');
+    } catch(error) {
+      // Roll back only the trigger this attempt created, never an existing owner's schedule.
+      if(trigger) {
+        try {ScriptApp.deleteTrigger(trigger);} catch(_) {}
+        try {
+          var saved=JSON.parse(properties.getProperty('MONITOR_INSTALLATION_JSON'));
+          if(saved && saved.trigger_id===trigger.getUniqueId()) properties.deleteProperty('MONITOR_INSTALLATION_JSON');
+        } catch(_) {}
+      }
+      throw error;
+    }
+  }
+  if(!inspectMonitor_(configuration).installed) fail_('monitor_verification_required');
+  return {ok:true,installed:true,interval_minutes:30,cloud_source_verified_at:checked.cloud_source_verified_at,last_cloud_source_check:checked.last_cloud_source_check};
 }

@@ -24,7 +24,7 @@ function harness({session={cookies:[cookie('campus'),cookie('sso',SSO)],origins:
     if (!fetch) throw new Error('Unexpected fixture request');
     return fetch(url,options,{advance:ms=>{now+=ms;},requests});
   }},loadSession_:()=>plain(session),getLastPlacementCheck_:()=>lastCheck,
-  saveSession_:(value,verifiedAt)=>saved.push({session:plain(value),verifiedAt}),URL:undefined});
+  saveCloudSession_:(value,verifiedAt)=>saved.push({session:plain(value),verifiedAt,cloudRead:true}),URL:undefined});
   vm.runInContext(source,context,{filename:'Source.gs'});
   return {context,requests,saved,session,run:()=>context.readPlacementSource_(),advance:ms=>{now+=ms;}};
 }
@@ -98,6 +98,7 @@ function harness({session={cookies:[cookie('campus'),cookie('sso',SSO)],origins:
   assert.equal(snapshot.complete,true);assert.equal(snapshot.posts.length,2);
   assert.equal(snapshot.observed_at,new Date(NOW).toISOString());assert.equal(snapshot.source_url,BLOG);
   assert.equal(h.saved.length,1);assert.equal(h.saved[0].session.cookies.find(c=>c.name==='campus').value,'fresh');
+  assert.equal(h.saved[0].cloudRead,true);
   assert.deepEqual(h.saved[0].session.origins,[]);assert.equal(h.requests.length,5);
   assert.equal(h.session.cookies[0].value,'fixture-campus');
 }

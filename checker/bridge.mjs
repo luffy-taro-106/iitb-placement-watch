@@ -1,6 +1,6 @@
 import {createHmac,randomBytes} from 'node:crypto';
 import {PolicyError} from './policy.mjs';
-const ACTIONS=new Set(['get_session','save_session','ingest_snapshot','status']);
+const ACTIONS=new Set(['get_session','save_session','install_monitor','ingest_snapshot','status']);
 export function bridgeConfig(env=process.env) {
   let url;try {url=new URL(env.IITB_BRIDGE_URL);}catch {throw new PolicyError('BRIDGE_CONFIGURATION_REQUIRED');}
   if (url.origin!=='https://script.google.com' || !/^\/macros\/s\/[a-z\d_-]+\/exec$/i.test(url.pathname) || url.username || url.password || url.search || url.hash ||
