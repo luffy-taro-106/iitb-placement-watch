@@ -24,7 +24,7 @@ function validInstant_(value, recent) {
 }
 function verifyEnvelope_(body, properties, nowSeconds) {
   requireObject_(body);
-  if (!['get_session', 'save_session', 'ingest_snapshot', 'status', 'install_monitor', 'connection_diagnostics'].includes(body.action) || !/^[a-f0-9]{32}$/.test(body.nonce || '') || !Number.isSafeInteger(body.issued_at)) fail_('invalid_request');
+  if (!['get_session', 'save_session', 'ingest_snapshot', 'status', 'install_monitor', 'connection_diagnostics', 'configure_notifications', 'resend_announcement'].includes(body.action) || !/^[a-f0-9]{32}$/.test(body.nonce || '') || !Number.isSafeInteger(body.issued_at)) fail_('invalid_request');
   if (nowSeconds - body.issued_at > 300 || body.issued_at - nowSeconds > 60) fail_('expired_request');
   requireObject_(body.payload);
   var secret = properties.getProperty('BRIDGE_SECRET');
@@ -63,6 +63,19 @@ function doPost(e) {
       if (Object.keys(request.payload).length) fail_('invalid_payload');
       requireExecutionOwner_(configuration);
       return jsonOutput_(connectionDiagnostics_(properties));
+    }
+    if (request.action === 'configure_notifications') {
+      requireExecutionOwner_(configuration);
+      if (Object.keys(request.payload).some(function(key){return key!=='announcement_recipients';})) fail_('invalid_payload');
+      var updated=Object.assign({},configuration,{announcement_recipients:validateAnnouncementRecipients_(request.payload.announcement_recipients,configuration.recipient_email)});
+      checkConfiguration_(updated,configuration.recipient_email.toLowerCase());
+      privateWrite_('CONFIG_FILE_ID',updated);
+      return jsonOutput_({ok:true,announcement_recipients:updated.announcement_recipients});
+    }
+    if (request.action === 'resend_announcement') {
+      requireExecutionOwner_(configuration);
+      if (Object.keys(request.payload).some(function(key){return !['post_id','request_id'].includes(key);})) fail_('invalid_payload');
+      return jsonOutput_(resendAnnouncement_(configuration,request.payload));
     }
     if (request.action === 'install_monitor') {
       if (Object.keys(request.payload).length) fail_('invalid_payload');
@@ -134,6 +147,7 @@ function createPrivateFile_(name, value, owner) {
 function checkConfiguration_(configuration, owner) {
   requireObject_(configuration);
   if (typeof configuration.recipient_email !== 'string' || configuration.recipient_email.toLowerCase() !== owner || typeof configuration.calendar_id !== 'string' || configuration.calendar_id.toLowerCase() !== owner || configuration.timezone !== 'Asia/Kolkata' || configuration.baseline_cutoff !== BASELINE_CUTOFF_) fail_('wrong_account');
+  if (configuration.announcement_recipients!==undefined) validateAnnouncementRecipients_(configuration.announcement_recipients,owner);
   var primary = Calendar.CalendarList.get('primary');
   if (!primary || String(primary.id).toLowerCase() !== configuration.calendar_id.toLowerCase() || !['owner','writer'].includes(primary.accessRole)) fail_('wrong_account');
   return configuration;
@@ -207,7 +221,7 @@ function status_(configuration) {
   var state=loadState_(),stored=privateRead_('SESSION_FILE_ID'),session=stored.session || null;
   var monitor=inspectMonitor_(configuration || loadConfiguration_()),connected=sessionConnected_(session),proof=cloudSourceVerifiedAt_(stored);
   var error=state.last_error ? ['source_check_failed','delivery_needs_review','calendar_needs_review','operation_failed'].includes(state.last_error)?state.last_error:'operation_failed' : null;
-  return {ok:true,connected:connected,session_status:!session?'missing':!connected?'expired':proof && error!=='source_check_failed'?'cloud_verified':'saved_not_live_verified',session_verified_at:stored.verified_at || null,cloud_source_verified_at:proof,last_cloud_source_check:proof,last_successful_check:state.last_successful_check || null,last_error:error,post_count:Object.keys(state.posts).length,pending_count:state.pending.length,meeting_count:Object.keys(state.meetings).length,delivery_count:state.deliveries.length,monitor_installed:monitor.installed,interval_minutes:monitor.installed?30:null,monitor_interval_minutes:monitor.installed?30:null,needs_attention:!!state.email_attempt || !!error || !!monitor.error || state.pending.some(function(p){return p.calendar_complete===false;})};
+  return {ok:true,connected:connected,session_status:!session?'missing':!connected?'expired':proof && error!=='source_check_failed'?'cloud_verified':'saved_not_live_verified',session_verified_at:stored.verified_at || null,cloud_source_verified_at:proof,last_cloud_source_check:proof,last_successful_check:state.last_successful_check || null,last_error:error,post_count:Object.keys(state.posts).length,pending_count:state.pending.length,meeting_count:Object.keys(state.meetings).length,delivery_count:state.deliveries.length,monitor_installed:monitor.installed,interval_minutes:monitor.installed?30:null,monitor_interval_minutes:monitor.installed?30:null,needs_attention:!!state.email_attempt || !!state.replay_attempt || !!error || !!monitor.error || state.pending.some(function(p){return p.calendar_complete===false;})};
 }
 function runCheck() {
   var lock=LockService.getScriptLock(); if (!lock.tryLock(1000)) return {ok:false,error:'busy'};

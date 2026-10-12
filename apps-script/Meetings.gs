@@ -110,7 +110,7 @@ function assertOwnedMeetingEvent_(event,configuration,post,record,key,meeting) {
   var recordedProof=(!record || event.id===record.event_id) && (event.description || '').includes(source) && titleMatch && timeMatch;
   if(!appProof && !recordedProof)fail_('calendar_review_required');
 }
-function calendarResult_(state, configuration, post) {
+function meetingCalendarResult_(state, configuration, post) {
   var meeting=parseMeeting_(post);
   if (meeting.kind==='announcement' || meeting.kind==='ambiguous') return meeting;
   var existing=matchingMeeting_(state,post,meeting);

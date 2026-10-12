@@ -13,6 +13,17 @@ function validatePosts_(payload) {
   });
 }
 function postFingerprint_(post) { return sha256_(JSON.stringify([post.title,post.text,post.links.map(function(a){return a.url;}).sort()])); }
+function validateAnnouncementRecipients_(recipients,owner) {
+  if(!Array.isArray(recipients) || !recipients.length || recipients.length>10)fail_('invalid_payload');
+  var seen={},result=recipients.map(function(address){
+    if(typeof address!=='string' || address.length>254 || !/^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,63}$/.test(address))fail_('invalid_payload');
+    var normalized=address.toLowerCase();if(seen[normalized])fail_('invalid_payload');seen[normalized]=true;return normalized;
+  });
+  if(!seen[owner.toLowerCase()])fail_('invalid_payload');return result;
+}
+function announcementRecipients_(configuration) {
+  return validateAnnouncementRecipients_(configuration.announcement_recipients || [configuration.recipient_email],configuration.recipient_email);
+}
 function htmlEscape_(value) { return String(value).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
 function comparePublishedPosts_(left,right) {
   var dateOrder=Date.parse(left.published)-Date.parse(right.published);
@@ -36,6 +47,7 @@ function ingestSnapshot_(payload,configuration) {
     state.posts[post.id]=Object.assign({},old || {},post,{fingerprint:fingerprint});
   });
   state.last_successful_check=payload.observed_at;state.last_error=null;saveState_(state);
+  if(!state.deadline_calendar_migrated) reconcileExistingDeadlines_(state,configuration);
   deliverPending_(state,configuration);
   var attention=state.pending.some(function(post){return post.calendar_complete===false;});
   if(attention){state.last_error='calendar_needs_review';saveState_(state);}
@@ -52,10 +64,16 @@ function ownerMailbox_(value,recipient) {
   var display=value.match(/^(?:"[^"\r\n]*"|[^<>,;\r\n]*)\s*<([^<>\s,;]+)>$/);
   return (display?display[1]:value).toLowerCase()===recipient.toLowerCase();
 }
-function verifySentOwner_(message,recipient) {
+function verifySentOwner_(message,recipient,attempt) {
   if(!message || !(message.labelIds || []).includes('SENT'))fail_('uncertain_email_delivery');
   var headers=mailHeaders_(message);
-  if(!ownerMailbox_(headers.to,recipient) || !ownerMailbox_(headers.from,recipient) || headers.cc || headers.bcc)fail_('uncertain_email_delivery');
+  var expected=attempt && attempt.recipients ? validateAnnouncementRecipients_(attempt.recipients,recipient) : [recipient.toLowerCase()];
+  var actual=String(headers.to || '').split(',').map(function(address){
+    var match=address.trim().match(/^(?:"[^"\r\n]*"|[^<>,;\r\n]*)\s*<([^<>\s,;]+)>$/);
+    return (match?match[1]:address.trim()).toLowerCase();
+  });
+  if(actual.length!==expected.length || new Set(actual).size!==actual.length || actual.some(function(address){return expected.indexOf(address)===-1;}) || !ownerMailbox_(headers.from,recipient) || headers.cc || headers.bcc)fail_('uncertain_email_delivery');
+  if(attempt && attempt.subject && decodedSubject_(headers.subject)!==attempt.subject)fail_('uncertain_email_delivery');
   return headers;
 }
 function mailHtml_(message) {
@@ -95,7 +113,7 @@ function verifyDeliveryBody_(message,attempt,headers) {
   if(attempt.delivery_reference && (headers['x-iitb-placement-delivery']!==attempt.delivery_reference || !body.includes('<p>Delivery reference: '+attempt.delivery_reference+'</p>')))fail_('uncertain_email_delivery');
 }
 function verifyMail_(message,messageId,recipient,attempt) {
-  var headers=verifySentOwner_(message,recipient);
+  var headers=verifySentOwner_(message,recipient,attempt);
   if(attempt && attempt.delivery_reference)verifyDeliveryBody_(message,attempt,headers);
   else {
     // Preserve recovery of messages from the original exact-Message-ID protocol.
@@ -139,11 +157,14 @@ function digestBody_(state,revisions,reference) {
     var post=state.pending.find(function(p){return p.id===revision.id && p.fingerprint===revision.fingerprint;});
     if(!post || !['announcement','calendar_recovery'].includes(revision.channel))fail_('uncertain_email_delivery');
     body+='<h3>'+htmlEscape_(post.title)+'</h3>';
-    if(revision.channel==='announcement')body+='<p>'+htmlEscape_(post.text.slice(0,3000))+'</p>';
+    if(revision.channel==='announcement')body+='<p>'+htmlEscape_(post.text).replace(/\n/g,'<br>')+'</p>';
     else body+='<p>The earlier calendar action has now been completed.</p>';
     body+='<p><a href="'+htmlEscape_(post.url)+'">Placement blog source</a></p>';
     if(post.calendar_result) body+='<p>'+htmlEscape_(post.calendar_result.message || '')+'</p>';
     if(post.calendar_result && post.calendar_result.start) body+='<p>Meeting start: '+htmlEscape_(Utilities.formatDate(new Date(post.calendar_result.start),'Asia/Kolkata','dd MMM yyyy, h:mm a'))+' IST.</p>';
+    if(post.calendar_result && post.calendar_result.deadlines)post.calendar_result.deadlines.forEach(function(deadline){
+      if(deadline.start)body+='<p>Deadline: '+htmlEscape_(Utilities.formatDate(new Date(deadline.start),'Asia/Kolkata','dd MMM yyyy, h:mm a'))+' IST. Google Calendar email reminder: one hour before.</p>';
+    });
     if(post.links.length) body+='<p>'+post.links.slice(0,25).map(function(link){return '<a href="'+htmlEscape_(link.url)+'">'+htmlEscape_(link.text || link.url)+'</a>';}).join(' · ')+'</p>';
   });
   if(reference)body+='<p>Delivery reference: '+reference+'</p>';
@@ -154,9 +175,34 @@ function preserveAttemptBody_(state,attempt) {
   if(!attempt.body_sha256) {attempt.body_sha256=sha256_(canonicalMailHtml_(digestBody_(state,attempt.revisions,attempt.delivery_reference || null)));saveState_(state);}
 }
 function htmlMailRaw_(recipient,subject,attempt,body) {
-  var headers=['From: '+recipient,'To: '+recipient,'Subject: '+subject,'Message-ID: '+attempt.message_id];
+  var recipients=attempt.recipients?validateAnnouncementRecipients_(attempt.recipients,recipient):[recipient];
+  var headers=['From: '+recipient,'To: '+recipients.join(', '),'Subject: '+subjectHeader_(subject),'Message-ID: '+attempt.message_id];
   if(attempt.delivery_reference)headers.push('X-IITB-Placement-Delivery: '+attempt.delivery_reference);
   return headers.concat(['MIME-Version: 1.0','Content-Type: text/html; charset=UTF-8','Content-Transfer-Encoding: base64','',''+Utilities.base64Encode(Utilities.newBlob(body).getBytes())]).join('\r\n');
+}
+function announcementSubject_(posts) {
+  var titles=posts.map(function(post){return normalized_(post.title).replace(/\s+/g,' ');});
+  if(titles.length===1)return titles[0].slice(0,200);
+  var subject='',included=0;
+  titles.forEach(function(title){if(included<3 && (subject.length+title.length+3)<=180){subject+=(subject?' ; ':'')+title;included++;}});
+  if(!included){subject=titles[0].slice(0,150);included=1;}
+  return subject+(included<titles.length?' (+'+(titles.length-included)+' more)':'');
+}
+function subjectHeader_(subject) {
+  subject=String(subject).replace(/[\r\n\x00-\x1f\x7f]/g,' ').trim();
+  if(!subject || subject.length>220)fail_('invalid_payload');
+  if(/^[\x20-\x7e]+$/.test(subject))return subject;
+  var words=[],part='';
+  Array.from(subject).forEach(function(character){
+    if(Utilities.newBlob(part+character).getBytes().length>42){words.push('=?UTF-8?B?'+Utilities.base64Encode(Utilities.newBlob(part).getBytes())+'?=');part='';}
+    part+=character;
+  });
+  if(part)words.push('=?UTF-8?B?'+Utilities.base64Encode(Utilities.newBlob(part).getBytes())+'?=');return words.join('\r\n ');
+}
+function decodedSubject_(value) {
+  return String(value || '').replace(/(\?=)\s+(?==\?UTF-8\?B\?)/gi,'$1').replace(/=\?UTF-8\?B\?([A-Za-z0-9+/=]+)\?=/gi,function(_,encoded){
+    try{return Utilities.newBlob(Utilities.base64DecodeWebSafe(encoded.replace(/\+/g,'-').replace(/\//g,'_'))).getDataAsString('UTF-8');}catch(_){fail_('uncertain_email_delivery');}
+  });
 }
 function pruneDeliveredPending_(state) {
   state.pending=state.pending.filter(function(post){return !post.notified_email_id || !post.calendar_complete || post.calendar_followup_pending;});saveState_(state);
@@ -173,7 +219,7 @@ function recoverSentPlacementDigest(providerMessageId) {
     digestBody_(state,attempt.revisions,attempt.delivery_reference || null);preserveAttemptBody_(state,attempt);
     var message=Gmail.Users.Messages.get('me',providerMessageId,{format:'full'});
     if(!message || message.id!==providerMessageId)fail_('uncertain_email_delivery');
-    var headers=verifySentOwner_(message,configuration.recipient_email);verifyDeliveryBody_(message,attempt,headers);
+    var headers=verifySentOwner_(message,configuration.recipient_email,attempt);verifyDeliveryBody_(message,attempt,headers);
     acknowledgeEmail_(state,attempt,providerMessageId);pruneDeliveredPending_(state);
     return {ok:true,recovered:true,pending_count:state.pending.length};
   } finally {lock.releaseLock();}
@@ -197,6 +243,7 @@ function calendarWorkResult_(state,configuration,post) {
   return calendarResult_(state,configuration,post);
 }
 function deliverPending_(state,configuration) {
+  if(state.replay_attempt) recoverReplay_(state,configuration);
   if(state.email_attempt) {
     preserveAttemptBody_(state,state.email_attempt);
     var recovered=findSent_(state.email_attempt.message_id,configuration.recipient_email,state.email_attempt);
@@ -218,10 +265,11 @@ function deliverPending_(state,configuration) {
   var recipients=state.pending.filter(function(p){return !p.notified_email_id || p.calendar_followup_pending;});
   if(recipients.length) {
     var revisions=recipients.map(function(p){return {id:p.id,fingerprint:p.fingerprint,channel:p.notified_email_id?'calendar_recovery':'announcement'};});
-    var digestId=sha256_(JSON.stringify(revisions)), messageId='<iitb-placement-'+digestId+'@placement-watch.invalid>';
+    var mailRecipients=announcementRecipients_(configuration);
+    var digestId=sha256_(JSON.stringify([revisions,mailRecipients])), messageId='<iitb-placement-'+digestId+'@placement-watch.invalid>';
     var reference='IITB-PW-'+digestId;
-    var body=digestBody_(state,revisions,reference),attempt={message_id:messageId,delivery_reference:reference,body_sha256:sha256_(canonicalMailHtml_(body)),revisions:revisions,started_at:new Date().toISOString()};
-    var subject='IITB placement: '+recipients.length+' update'+(recipients.length===1?'':'s');
+    var subject=announcementSubject_(recipients);
+    var body=digestBody_(state,revisions,reference),attempt={message_id:messageId,delivery_reference:reference,body_sha256:sha256_(canonicalMailHtml_(body)),revisions:revisions,recipients:mailRecipients,subject:subject,started_at:new Date().toISOString()};
     var raw=htmlMailRaw_(configuration.recipient_email,subject,attempt,body);
     var already=findSent_(messageId,configuration.recipient_email,attempt);
     if(already) acknowledgeEmail_(state,attempt,already);
@@ -238,6 +286,50 @@ function deliverPending_(state,configuration) {
     }
   }
   pruneDeliveredPending_(state);
+}
+function acknowledgeReplay_(state,attempt,id) {
+  if(!state.replay_deliveries)state.replay_deliveries={};
+  var receipt={email_id:id,post_id:attempt.post_id,subject:attempt.subject,recipients:attempt.recipients,at:new Date().toISOString()};
+  state.replay_deliveries[attempt.request_id]=receipt;state.replay_attempt=null;saveState_(state);
+  return Object.assign({ok:true,resent:true},receipt);
+}
+function recoverReplay_(state,configuration) {
+  var attempt=state.replay_attempt;
+  var recovered=findSent_(attempt.message_id,configuration.recipient_email,attempt);
+  if(!recovered)fail_('uncertain_email_delivery');
+  return acknowledgeReplay_(state,attempt,recovered);
+}
+function resendAnnouncement_(configuration,payload) {
+  if(!/^post-\d+$/.test(payload.post_id || '') || !/^[A-Za-z0-9_-]{8,64}$/.test(payload.request_id || ''))fail_('invalid_payload');
+  var state=loadState_(),post=state.posts[payload.post_id];
+  if(!post || !post.text || !post.title || !post.published)fail_('invalid_snapshot');
+  if(state.email_attempt)fail_('uncertain_email_delivery');
+  if(state.replay_attempt) {
+    if(state.replay_attempt.request_id!==payload.request_id || state.replay_attempt.post_id!==payload.post_id)fail_('uncertain_email_delivery');
+    return recoverReplay_(state,configuration);
+  }
+  var saved=state.replay_deliveries && state.replay_deliveries[payload.request_id];
+  if(saved) {
+    if(saved.post_id!==payload.post_id)fail_('invalid_payload');
+    return Object.assign({ok:true,resent:true},saved);
+  }
+  post=Object.assign({},post,{id:payload.post_id});post.calendar_result=calendarResult_(state,configuration,post);
+  var recipients=announcementRecipients_(configuration),subject=announcementSubject_([post]);
+  var hash=sha256_(JSON.stringify(['requested_resend',payload.request_id,post.id,postFingerprint_(post),recipients]));
+  var reference='IITB-PW-TEST-'+hash,messageId='<iitb-placement-test-'+hash+'@placement-watch.invalid>';
+  var revisions=[{id:post.id,fingerprint:post.fingerprint || postFingerprint_(post),channel:'announcement'}];
+  var body=digestBody_({pending:[Object.assign({},post,{fingerprint:revisions[0].fingerprint})]},revisions,reference);
+  var attempt={request_id:payload.request_id,post_id:post.id,message_id:messageId,delivery_reference:reference,body_sha256:sha256_(canonicalMailHtml_(body)),recipients:recipients,subject:subject,started_at:new Date().toISOString()};
+  var prior=findSent_(messageId,configuration.recipient_email,attempt);
+  if(prior)return acknowledgeReplay_(state,attempt,prior);
+  state.replay_attempt=attempt;saveState_(state);
+  var sent=Gmail.Users.Messages.send({raw:Utilities.base64EncodeWebSafe(Utilities.newBlob(htmlMailRaw_(configuration.recipient_email,subject,attempt,body)).getBytes()).replace(/=+$/,'')},'me');
+  if(!sent || !sent.id)fail_('uncertain_email_delivery');
+  attempt.provider_message_id=sent.id;saveState_(state);
+  var verified=Gmail.Users.Messages.get('me',sent.id,{format:'full'});
+  if(!verified || verified.id!==sent.id)fail_('uncertain_email_delivery');
+  verifyMail_(verified,messageId,configuration.recipient_email,attempt);
+  return acknowledgeReplay_(state,attempt,sent.id);
 }
 function notifyFailureOnce_(state,configuration) {
   if(!state.failure) {state.failure={episode:Utilities.getUuid(),attempted:false,notified_email_id:null};saveState_(state);}
