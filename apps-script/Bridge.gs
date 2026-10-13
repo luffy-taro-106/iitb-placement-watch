@@ -24,7 +24,7 @@ function validInstant_(value, recent) {
 }
 function verifyEnvelope_(body, properties, nowSeconds) {
   requireObject_(body);
-  if (!['get_session', 'save_session', 'ingest_snapshot', 'status', 'install_monitor', 'connection_diagnostics', 'configure_notifications', 'resend_announcement'].includes(body.action) || !/^[a-f0-9]{32}$/.test(body.nonce || '') || !Number.isSafeInteger(body.issued_at)) fail_('invalid_request');
+  if (!['get_session', 'save_session', 'ingest_snapshot', 'status', 'install_monitor', 'connection_diagnostics', 'configure_notifications', 'resend_announcement','configure_whatsapp','whatsapp_status'].includes(body.action) || !/^[a-f0-9]{32}$/.test(body.nonce || '') || !Number.isSafeInteger(body.issued_at)) fail_('invalid_request');
   if (nowSeconds - body.issued_at > 300 || body.issued_at - nowSeconds > 60) fail_('expired_request');
   requireObject_(body.payload);
   var secret = properties.getProperty('BRIDGE_SECRET');
@@ -59,6 +59,15 @@ function doPost(e) {
       return jsonOutput_({ok:true, connected:true});
     }
     if (request.action === 'status') return jsonOutput_(status_(configuration));
+    if (request.action === 'configure_whatsapp') {
+      requireExecutionOwner_(configuration);
+      return jsonOutput_(configureWhatsApp_(configuration,request.payload));
+    }
+    if (request.action === 'whatsapp_status') {
+      requireExecutionOwner_(configuration);
+      if(Object.keys(request.payload).length)fail_('invalid_payload');
+      return jsonOutput_(whatsappStatus_(configuration));
+    }
     if (request.action === 'connection_diagnostics') {
       if (Object.keys(request.payload).length) fail_('invalid_payload');
       requireExecutionOwner_(configuration);
@@ -85,7 +94,7 @@ function doPost(e) {
     }
     return jsonOutput_(ingestSnapshot_(request.payload, configuration));
   } catch (error) {
-    var allowed = ['busy','invalid_request','invalid_payload','expired_request','replayed_request','authentication_failed','setup_required','invalid_source','invalid_session','invalid_timestamp','stale_snapshot','invalid_snapshot','wrong_account','private_storage_required','uncertain_email_delivery','calendar_review_required','source_connection_required','delivery_needs_review','duplicate_monitor_triggers','monitor_verification_required'];
+    var allowed = ['busy','invalid_request','invalid_payload','expired_request','replayed_request','authentication_failed','setup_required','invalid_source','invalid_session','invalid_timestamp','stale_snapshot','invalid_snapshot','wrong_account','private_storage_required','uncertain_email_delivery','calendar_review_required','source_connection_required','delivery_needs_review','duplicate_monitor_triggers','monitor_verification_required','whatsapp_connection_required','whatsapp_review_required','whatsapp_unavailable'];
     return jsonOutput_({ok:false, error:allowed.includes(error.message) ? error.message : 'operation_failed'});
   } finally { lock.releaseLock(); }
 }
@@ -148,6 +157,7 @@ function checkConfiguration_(configuration, owner) {
   requireObject_(configuration);
   if (typeof configuration.recipient_email !== 'string' || configuration.recipient_email.toLowerCase() !== owner || typeof configuration.calendar_id !== 'string' || configuration.calendar_id.toLowerCase() !== owner || configuration.timezone !== 'Asia/Kolkata' || configuration.baseline_cutoff !== BASELINE_CUTOFF_) fail_('wrong_account');
   if (configuration.announcement_recipients!==undefined) validateAnnouncementRecipients_(configuration.announcement_recipients,owner);
+  if(configuration.whatsapp!==undefined)validateWhatsAppConfiguration_(configuration.whatsapp);
   var primary = Calendar.CalendarList.get('primary');
   if (!primary || String(primary.id).toLowerCase() !== configuration.calendar_id.toLowerCase() || !['owner','writer'].includes(primary.accessRole)) fail_('wrong_account');
   return configuration;

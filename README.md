@@ -1,6 +1,6 @@
 # IITB Placement Watch
 
-A personal placement monitor that runs in Google Apps Script, using its free consumer-account allowance. It checks the official IITB placement blog every 30 minutes, emails new announcements to its configured owner, and saves clearly timed future meetings to that owner's Google Calendar.
+A personal placement monitor that runs in Google Apps Script, using its free consumer-account allowance. It checks the official IITB placement blog every 30 minutes, emails new announcements to its configured subscribers, and saves clearly timed future meetings and deadlines to its owner's Google Calendar.
 
 Production uses no paid AI, browser provider or permanent GitHub runner. GitHub stores only generic code, with an optional manually started development-test workflow. The fixture tests can run locally when GitHub execution is unavailable; no payment is needed for the monitor.
 
@@ -34,6 +34,17 @@ The helper never applies to jobs, fills forms, submits attendance, buys anything
 Production uses the free Google Apps Script allowance. Quota exhaustion stops operations; this code does not provision a billed Google Cloud project or use a paid service. The one-time Chrome connector requires no subscription. Do not start paid Codespaces usage. Timing can vary and account or IITB policy changes can interrupt checks. A successful logged-in browser view alone does not establish unattended cloud access.
 
 Official references: [Apps Script quotas](https://developers.google.com/apps-script/guides/services/quotas), [installable triggers](https://developers.google.com/apps-script/guides/triggers/installable), [GitHub additional terms](https://docs.github.com/en/site-policy/github-terms/github-terms-for-additional-products-and-features), [Codespaces billing](https://docs.github.com/en/billing/concepts/product-billing/github-codespaces).
+
+## Optional WhatsApp channel
+
+[The separate WhatsApp relay](whatsapp-relay/README.md) supports explicitly selected
+receiving numbers and existing groups, using a separately linked sending account.
+Its Free Render service can sleep between alerts; a separate Free Supabase
+database retains device keys and the durable queue. Google sends only new
+announcement payloads to the signed relay, never IITB cookies or its admin secret.
+QR linking, recipients and live proof must be verified before enabling the
+optional channel. Relay failures leave email and Calendar operations running.
+Read the relay setup and limits before deployment; it is disabled by default.
 
 ## Development
 

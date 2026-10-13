@@ -39,6 +39,7 @@ function ingestSnapshot_(payload,configuration) {
     var old=state.posts[post.id], fingerprint=postFingerprint_(post), legacy=old && /^[a-f0-9]{8}$/.test(old.fingerprint || '');
     var isNew=!old && Date.parse(post.published)>Date.parse(state.baseline_cutoff);
     if(isNew || (old && !legacy && old.fingerprint!==fingerprint)) {
+      if(typeof queueWhatsAppPost_==='function')queueWhatsAppPost_(state,Object.assign({},post,{fingerprint:fingerprint}),configuration,isNew);
       // A newer revision also supersedes unfinished calendar work from an already mailed revision.
       // Sent history and an uncertain email_attempt remain independent and are still recovered below.
       state.pending=state.pending.filter(function(p){return p.id!==post.id || p.fingerprint===fingerprint;});
@@ -49,6 +50,7 @@ function ingestSnapshot_(payload,configuration) {
   state.last_successful_check=payload.observed_at;state.last_error=null;saveState_(state);
   if(!state.deadline_calendar_migrated) reconcileExistingDeadlines_(state,configuration);
   deliverPending_(state,configuration);
+  if(typeof flushWhatsApp_==='function')flushWhatsApp_(configuration);
   var attention=state.pending.some(function(post){return post.calendar_complete===false;});
   if(attention){state.last_error='calendar_needs_review';saveState_(state);}
   return {ok:true,needs_attention:attention,pending_count:state.pending.length,last_successful_check:state.last_successful_check,delivery_count:state.deliveries.length,meeting_count:Object.keys(state.meetings).length};
