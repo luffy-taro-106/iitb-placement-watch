@@ -56,8 +56,11 @@ before network sending. A server acknowledgment marks `acknowledged`; receipt
 signals are recorded separately (a group receipt does not prove every member
 received/read the message). Crash/timeout attempts become `uncertain` and never
 automatically resend. A receipt can resolve uncertainty. Delivery review and
-account reconnect are owner-only actions. A session advisory lock prevents
-overlapping deployments from sending through the same linked device.
+account reconnect are owner-only actions. An expiring database row lease prevents
+overlapping deployments from sending through the same linked device. The lease
+renews every 10 seconds and expires after 45 seconds; losing ownership stops
+the WhatsApp client. It does not depend on pooled SQL session locks surviving
+a cloud restart. New workers wait for ownership and automatically recover.
 
 Run `go test -race ./...` and `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./...`.
 Tests use synthetic announcements and never connect to WhatsApp or send alerts.

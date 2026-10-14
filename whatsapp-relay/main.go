@@ -48,6 +48,7 @@ type app struct {
 	relaySecret string
 	origin      string
 	wake        chan struct{}
+	workerCtx   context.Context
 }
 
 func main() {
@@ -66,7 +67,7 @@ func main() {
 	}
 	defer s.db.Close()
 	a := &app{store: s, adminSecret: admin, relaySecret: relay, origin: origin, wake: make(chan struct{}, 1), pairState: "not_linked"}
-	go a.run(ctx)
+	go a.supervise(ctx)
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -85,19 +86,54 @@ func main() {
 }
 
 func (a *app) run(ctx context.Context) {
-	// A session advisory lock prevents two cloud deployments from connecting
-	// the same WhatsApp device or recovering each other's in-flight attempts.
-	conn, err := a.store.db.Conn(ctx)
-	if err != nil {
+	if a.store.ensureLeaseTable(ctx) != nil {
+		log.Print("relay_lease_setup_required")
 		return
 	}
-	defer conn.Close()
-	var locked bool
-	if conn.QueryRowContext(ctx, "SELECT pg_try_advisory_lock(714826403195)").Scan(&locked) != nil || !locked {
-		log.Print("relay_worker_already_active")
-		return
+	owner := leaseOwner()
+	for {
+		probe, cancel := context.WithTimeout(ctx, 10*time.Second)
+		claimed, err := a.store.claimLease(probe, owner)
+		cancel()
+		if err != nil {
+			log.Print("relay_lease_unavailable")
+			return
+		}
+		if claimed {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
 	}
-	defer conn.ExecContext(context.Background(), "SELECT pg_advisory_unlock(714826403195)")
+	ctx, cancelWorker := context.WithCancel(ctx)
+	defer cancelWorker()
+	defer func() {
+		release, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		a.store.releaseLease(release, owner)
+	}()
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			probe, cancel := context.WithTimeout(ctx, 5*time.Second)
+			owned, err := a.store.renewLease(probe, owner)
+			cancel()
+			if err != nil || !owned {
+				log.Print("relay_lease_lost")
+				cancelWorker()
+				return
+			}
+		}
+	}()
 	container, err := a.store.upgrade(ctx)
 	if err != nil {
 		log.Print("private_schema_setup_required")
@@ -164,6 +200,7 @@ func (a *app) run(ctx context.Context) {
 	a.mu.Lock()
 	a.client = client
 	a.ready = true
+	a.workerCtx = ctx
 	if device.ID != nil {
 		a.pairState = "connecting"
 	}
@@ -181,23 +218,16 @@ func (a *app) run(ctx context.Context) {
 		case <-ticker.C:
 		case <-a.wake:
 		}
-		// If the lock connection is lost, stop the instance rather than send
-		// concurrently with a replacement that acquired the database lock.
-		probe, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err = conn.PingContext(probe)
-		cancel()
-		if err != nil {
-			a.mu.Lock()
-			a.ready = false
-			a.mu.Unlock()
-			client.Disconnect()
-			log.Print("relay_lock_lost")
-			return
-		}
 		if !client.IsLoggedIn() || !client.IsConnected() {
 			continue
 		}
 		for i := 0; i < 20; i++ {
+			probe, cancel := context.WithTimeout(ctx, 5*time.Second)
+			owned, err := a.store.renewLease(probe, owner)
+			cancel()
+			if err != nil || !owned {
+				return
+			}
 			j, err := a.store.nextJob(ctx)
 			if err == sql.ErrNoRows {
 				break
@@ -415,8 +445,12 @@ func (a *app) beginLink() error {
 	a.pairState = "waiting_for_scan"
 	a.pairError = ""
 	client := a.client
+	parent := a.workerCtx
 	a.mu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, 4*time.Minute)
 	client.Disconnect()
 	channel, err := client.GetQRChannel(ctx)
 	if err != nil {

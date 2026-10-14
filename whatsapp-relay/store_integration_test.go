@@ -53,6 +53,36 @@ func TestRealPrivateDatabasePersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err = s.ensureLeaseTable(ctx); err != nil {
+		t.Fatal("lease setup failed")
+	}
+	var leaseCount int
+	if s.db.QueryRowContext(ctx, "SELECT count(*) FROM relay_worker_lease").Scan(&leaseCount) != nil || leaseCount > 0 {
+		t.Fatal("fixture lease test requires no running worker")
+	}
+	ownerA, ownerB := "synthetic-lease-A", "synthetic-lease-B"
+	defer s.releaseLease(context.Background(), ownerA)
+	defer s.releaseLease(context.Background(), ownerB)
+	if won, err := s.claimLease(ctx, ownerA); err != nil || !won {
+		t.Fatal("first worker did not acquire lease")
+	}
+	if won, err := s.claimLease(ctx, ownerB); err != nil || won {
+		t.Fatal("overlapping worker acquired lease")
+	}
+	if owned, err := s.renewLease(ctx, ownerA); err != nil || !owned {
+		t.Fatal("owner could not renew lease")
+	}
+	if owned, err := s.renewLease(ctx, ownerB); err != nil || owned {
+		t.Fatal("non-owner renewed lease")
+	}
+	s.db.ExecContext(ctx, "UPDATE relay_worker_lease SET expires_at=now()-interval '1 second' WHERE owner=$1", ownerA)
+	if won, err := s.claimLease(ctx, ownerB); err != nil || !won {
+		t.Fatal("new worker could not recover expired lease")
+	}
+	if owned, err := s.renewLease(ctx, ownerA); err != nil || owned {
+		t.Fatal("expired owner resurrected lease")
+	}
+	s.releaseLease(ctx, ownerB)
 	defer s.db.Close()
 	container, err := s.upgrade(ctx)
 	if err != nil {
