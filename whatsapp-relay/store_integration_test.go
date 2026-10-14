@@ -9,6 +9,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"go.mau.fi/whatsmeow/proto/waAdv"
+	"go.mau.fi/whatsmeow/types"
 )
 
 func TestHTTPProtectsControlsAndHealth(t *testing.T) {
@@ -51,8 +54,29 @@ func TestRealPrivateDatabasePersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.db.Close()
-	if _, err = s.upgrade(ctx); err != nil {
+	container, err := s.upgrade(ctx)
+	if err != nil {
 		t.Fatal(err)
+	}
+	devices, err := container.GetAllDevices(ctx)
+	if err != nil || len(devices) > 0 {
+		t.Fatal("only run synthetic device-save test before account linkage")
+	}
+	device := container.NewDevice()
+	id := types.NewJID("19999999990", types.DefaultUserServer)
+	id.Device = 1
+	device.ID = &id
+	device.LID = types.NewJID("999999999999999", types.HiddenUserServer)
+	device.Account = &waAdv.ADVSignedDeviceIdentity{Details: []byte("synthetic-not-a-whatsapp-account"), AccountSignature: make([]byte, 64), AccountSignatureKey: make([]byte, 32), DeviceSignature: make([]byte, 64)}
+	if err = device.Save(ctx); err != nil {
+		t.Fatal("synthetic linked-device persistence failed: " + pairingErrorCode(err))
+	}
+	defer device.Delete(context.Background())
+	if err = device.Identities.PutIdentity(ctx, "synthetic-main-device", [32]byte{}); err != nil {
+		t.Fatal("synthetic identity persistence failed")
+	}
+	if err = device.Delete(ctx); err != nil {
+		t.Fatal("synthetic cleanup failed")
 	}
 	var bypass, createRole bool
 	if s.db.QueryRowContext(ctx, "SELECT rolbypassrls,rolcreaterole FROM pg_roles WHERE rolname=current_user").Scan(&bypass, &createRole) != nil || bypass || createRole {

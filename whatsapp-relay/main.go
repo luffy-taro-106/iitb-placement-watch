@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -42,6 +43,7 @@ type app struct {
 	qr          string
 	qrExpiry    time.Time
 	pairState   string
+	pairError   string
 	adminSecret string
 	relaySecret string
 	origin      string
@@ -126,8 +128,27 @@ func (a *app) run(ctx context.Context) {
 			a.mu.Lock()
 			a.qr = ""
 			a.pairState = "linked"
+			a.pairError = ""
 			a.mu.Unlock()
 			a.notify()
+		case *events.PairError:
+			a.recordPairError(pairingErrorCode(e.Error))
+		case *events.PairPasskeyRequest:
+			a.recordPairError("passkey_required")
+		case *events.PairPasskeyError:
+			a.recordPairError("passkey_verification_failed")
+		case *events.ConnectFailure:
+			a.recordPairError("whatsapp_connection_" + strconv.Itoa(int(e.Reason)))
+		case *events.ClientOutdated:
+			a.recordPairError("client_update_required")
+		case *events.StreamError:
+			code := "whatsapp_stream_rejected"
+			if len(e.Code) == 3 {
+				if _, err := strconv.Atoi(e.Code); err == nil {
+					code = "whatsapp_stream_" + e.Code
+				}
+			}
+			a.recordPairError(code)
 		case *events.Receipt:
 			// Record a receipt signal, without collecting incoming chat content.
 			if e.Type != types.ReceiptTypeDelivered && e.Type != types.ReceiptTypeRead {
@@ -247,6 +268,7 @@ func (a *app) handler() http.Handler {
 	mux.HandleFunc("POST /v1", a.signed)
 	mux.Handle("GET /api/status", a.admin(http.HandlerFunc(a.status)))
 	mux.Handle("POST /api/link", a.admin(http.HandlerFunc(a.link)))
+	mux.Handle("POST /api/phone-link", a.admin(http.HandlerFunc(a.phoneLink)))
 	mux.Handle("GET /api/qr", a.admin(http.HandlerFunc(a.qrImage)))
 	mux.Handle("GET /api/groups", a.admin(http.HandlerFunc(a.groups)))
 	mux.Handle("PUT /api/destinations", a.admin(http.HandlerFunc(a.targets)))
@@ -277,7 +299,7 @@ func (a *app) admin(next http.Handler) http.Handler {
 
 func (a *app) state(ctx context.Context) (map[string]any, error) {
 	a.mu.RLock()
-	client, ready, pairState := a.client, a.ready, a.pairState
+	client, ready, pairState, pairError := a.client, a.ready, a.pairState, a.pairError
 	a.mu.RUnlock()
 	counts, err := a.store.counts(ctx)
 	if err != nil {
@@ -289,7 +311,7 @@ func (a *app) state(ctx context.Context) (map[string]any, error) {
 	}
 	linked := client != nil && client.Store.ID != nil && pairState != "relink_required"
 	connected := client != nil && client.IsConnected() && client.IsLoggedIn()
-	return map[string]any{"ok": true, "ready": ready, "linked": linked, "connected": connected, "pair_state": pairState, "destination_count": len(targets), "counts": counts, "needs_attention": !ready || !linked || counts["uncertain"] > 0}, nil
+	return map[string]any{"ok": true, "ready": ready, "linked": linked, "connected": connected, "pair_state": pairState, "pair_error": pairError, "destination_count": len(targets), "counts": counts, "needs_attention": !ready || !linked || counts["uncertain"] > 0}, nil
 }
 
 func (a *app) signed(w http.ResponseWriter, r *http.Request) {
@@ -368,24 +390,30 @@ func (a *app) link(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 400, "explicit_consent_required")
 		return
 	}
+	if err := a.beginLink(); err != nil {
+		apiError(w, 503, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+func (a *app) beginLink() error {
 	a.mu.Lock()
 	if !a.ready || a.client == nil {
 		a.mu.Unlock()
-		apiError(w, 503, "relay_starting")
-		return
+		return errors.New("relay_starting")
 	}
 	if a.client.Store.ID != nil {
 		a.mu.Unlock()
-		apiError(w, 409, "already_linked")
-		return
+		return errors.New("already_linked")
 	}
 	if a.pairing {
 		a.mu.Unlock()
-		writeJSON(w, 200, map[string]any{"ok": true})
-		return
+		return nil
 	}
 	a.pairing = true
 	a.pairState = "waiting_for_scan"
+	a.pairError = ""
 	client := a.client
 	a.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
@@ -397,8 +425,7 @@ func (a *app) link(w http.ResponseWriter, r *http.Request) {
 		a.pairing = false
 		a.pairState = "link_failed"
 		a.mu.Unlock()
-		apiError(w, 503, "link_failed")
-		return
+		return errors.New("link_failed")
 	}
 	go func() {
 		defer cancel()
@@ -406,7 +433,7 @@ func (a *app) link(w http.ResponseWriter, r *http.Request) {
 			a.mu.Lock()
 			a.pairing = false
 			a.qr = ""
-			if a.pairState == "waiting_for_scan" {
+			if a.pairState == "waiting_for_scan" || a.pairState == "waiting_for_phone_code" {
 				a.pairState = "link_expired"
 			}
 			a.mu.Unlock()
@@ -419,19 +446,32 @@ func (a *app) link(w http.ResponseWriter, r *http.Request) {
 			} else if event.Event == "success" {
 				a.qr = ""
 				a.pairState = "linked"
+				a.pairError = ""
+			} else if event.Event == "passkey-request" {
+				a.qr = ""
+				a.pairState = "passkey_required"
+				a.pairError = "passkey_required"
+			} else if event.Event == "passkey-confirmation" {
+				a.qr = ""
+				a.pairState = "passkey_confirmation_required"
+				a.pairError = "passkey_confirmation_required"
 			} else {
 				a.qr = ""
 				a.pairState = "link_failed"
+				if event.Error != nil {
+					a.pairError = pairingErrorCode(event.Error)
+				} else if a.pairError == "" {
+					a.pairError = "pair_timeout"
+				}
 			}
 			a.mu.Unlock()
 		}
 	}()
 	if client.Connect() != nil {
 		cancel()
-		apiError(w, 503, "link_failed")
-		return
+		return errors.New("link_failed")
 	}
-	writeJSON(w, 200, map[string]any{"ok": true})
+	return nil
 }
 
 func (a *app) qrImage(w http.ResponseWriter, r *http.Request) {

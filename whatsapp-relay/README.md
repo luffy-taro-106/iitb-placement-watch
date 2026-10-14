@@ -64,3 +64,11 @@ Tests use synthetic announcements and never connect to WhatsApp or send alerts.
 Do not activate Google's optional channel until private status shows linked,
 connected, intended destinations and no unresolved attention. Activation sets
 a fresh cutoff and never blasts historical announcements.
+
+When QR linking fails, the protected setup page also supports WhatsApp's
+official "Link with phone number" flow. The user explicitly enters the separate
+sender's E.164 number and types the returned code on that phone. This does not
+change the receiving number or bypass additional account/passkey verification.
+The sender number and linking code are not logged or stored in the database.
+Expired QR images are removed. Private status reports only bounded failure
+categories and SQLSTATE codes, never raw SDK errors, IDs, keys or assertions.
