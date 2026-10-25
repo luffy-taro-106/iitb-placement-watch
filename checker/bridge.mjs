@@ -15,10 +15,11 @@ export function signedRequest(action,payload,secret,{nonce=randomBytes(16).toStr
   const signature=createHmac('sha256',secret).update(canonical(action,nonce,issued_at,payload),'utf8').digest('hex');
   return {action,nonce,issued_at,payload,signature};
 }
-export async function bridgeCall(config,action,payload={},fetchImpl=fetch) {
+export async function bridgeCall(config,action,payload={},fetchImpl=fetch,{signal:parentSignal,timeoutMs=90000}={}) {
+  if(parentSignal?.aborted)throw new PolicyError('BRIDGE_ABORTED');
   const body=JSON.stringify(signedRequest(action,payload,config.secret));
   if (Buffer.byteLength(body,'utf8')>1500000) throw new PolicyError('BRIDGE_PAYLOAD_TOO_LARGE');
-  let response;const signal=AbortSignal.timeout(90000);
+  let response;const timeout=AbortSignal.timeout(timeoutMs),signal=parentSignal?AbortSignal.any([parentSignal,timeout]):timeout;
   try {
     response=await fetchImpl(config.url,{method:'POST',headers:{'content-type':'application/json'},body,redirect:'manual',signal});
     for(let count=0;[301,302,303].includes(response.status);count++) {
@@ -30,7 +31,7 @@ export async function bridgeCall(config,action,payload={},fetchImpl=fetch) {
     }
     if([307,308].includes(response.status))throw new PolicyError('INVALID_BRIDGE_REDIRECT');
   }
-  catch {throw new PolicyError('BRIDGE_UNREACHABLE');}
+  catch {throw new PolicyError(parentSignal?.aborted?'BRIDGE_ABORTED':'BRIDGE_UNREACHABLE');}
   let result;
   try {
     if (!response.body) throw new Error();
@@ -45,7 +46,8 @@ export async function bridgeCall(config,action,payload={},fetchImpl=fetch) {
     } finally {reader.releaseLock();}
     result=JSON.parse(Buffer.concat(parts,size).toString('utf8'));
   }
-  catch {throw new PolicyError('INVALID_BRIDGE_RESPONSE');}
+  catch {throw new PolicyError(parentSignal?.aborted?'BRIDGE_ABORTED':'INVALID_BRIDGE_RESPONSE');}
+  if (response.ok && result?.ok===false && result.error==='busy') throw new PolicyError('BRIDGE_BUSY');
   if (!response.ok || result?.ok!==true) throw new PolicyError('BRIDGE_REQUEST_REJECTED');
   return result;
 }

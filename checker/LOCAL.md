@@ -12,10 +12,9 @@ retrieves the saved session for the check, reads complete pagination, and sends
 `ingest_local_snapshot`. Refreshed restricted cookies remain in the owner's
 private Google storage. The local status contains only timestamps, counts and
 fixed error codes. The process does not write passwords, cookies or tokens to
-logs or ordinary source files. Each process uses a private local lock; crashed
-locks become recoverable after ten minutes.
+logs or ordinary source files. Each process uses a private local lock; locks from exited processes are recoverable without stealing a live lock.
 
-The owner-approved macOS LaunchAgent uses `StartInterval:300` and `RunAtLoad:true`.
+The owner-approved macOS LaunchAgent uses five-minute calendar intervals and `RunAtLoad:true`.
 It runs in the signed-in user's session while the Mac is awake and connected to
 the institute network or VPN. Sleeping, shutdown, logging out, unavailable VPN,
 revoked authorization or another required IITB sign-in can interrupt it. There
@@ -41,3 +40,32 @@ Codex automation, start browser monitoring, or keep a second email/calendar
 implementation. The Google owner, subscribers, source and saved provider IDs are
 unchanged. Removing the LaunchAgent stops local polling; retain the private
 Google history.
+
+## Durable macOS installation and recovery
+
+Install with `node checker/install-local.mjs --node /absolute/path/to/node` using
+a verified standalone Node runtime. It copies the reader and runtime into the
+owner-only `~/Library/Application Support/IITB Placement Watch/` directory. The
+same existing LaunchAgent label then reads source, configuration and logs from
+that folder; it has no dependency on Desktop permissions, Codex remaining open,
+or a temporary runtime cache. Preserve private state when upgrading and reload
+that same LaunchAgent after installation.
+
+The job uses calendar minutes 0,5,…55 plus RunAtLoad, so missed calendar firings
+coalesce into a catch-up after wake. Only one job/lock owns the reader. A live
+process's lock is not deleted merely because it is old; dead process locks are
+recoverable, and only the matching owner token releases a lock. Status updates
+are atomic and retain the previous successful check and counts after failures.
+Logs rotate at a bounded size.
+
+The entire check has a time limit. Read-only bridge requests and transient source
+GET requests have bounded retries; authentication rejection remains distinct.
+An uncertain ingestion POST is never blindly repeated. It is accepted as
+completed only when the exact local observation and provider state are read back.
+The normal ingestion response includes mode/freshness, avoiding an unnecessary
+configuration POST on every already-active run.
+
+These recovery measures cannot keep a powered-off Mac online, restore an expired
+institute login indefinitely, or reach the institute without its network/VPN.
+Only enable a separate AC-only awake assertion when the owner chooses it; the
+reader itself does not change global sleep settings or weaken macOS protection.

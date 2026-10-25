@@ -85,6 +85,8 @@ function doPost(e) {
       properties.setProperty('LOCAL_SOURCE_LAST_SUCCESS',request.payload.observed_at);
       var localState=loadState_();localState.failure=null;saveState_(localState);
       properties.deleteProperty('SOURCE_FAILURE_JSON');
+      var localReport=sourceStatus_();
+      localResult.source_mode=localReport.mode;localResult.local_source_observed_at=localReport.local_source_observed_at;localResult.local_source_fresh=localReport.local_source_fresh;
       return jsonOutput_(localResult);
     }
     if (request.action === 'configure_source') {

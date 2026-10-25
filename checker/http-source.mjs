@@ -1,5 +1,6 @@
 import vm from 'node:vm';
 import {readFile} from 'node:fs/promises';
+import {setTimeout as delay} from 'node:timers/promises';
 import {BLOG,allowedSourceUrl,filterSession,listingUrl,PolicyError} from './policy.mjs';
 
 const source=await readFile(new URL('../apps-script/Source.gs',import.meta.url),'utf8');
@@ -25,22 +26,54 @@ async function boundedHtml(response) {
   return Buffer.concat(parts,bytes).toString('utf8');
 }
 
-export async function readHttpSnapshot(session,{fetchImpl=fetch,lastSuccessfulCheck=null,now=Date.now(),maxPages=25}={}) {
+export async function readHttpSnapshot(session,{fetchImpl=fetch,lastSuccessfulCheck=null,now=Date.now(),maxPages=25,signal:parentSignal,timeoutMs=parentSignal?110000:240000,requestTimeoutMs=20000,waitImpl=(ms,{signal}={})=>delay(ms,undefined,{signal})}={}) {
+  if(parentSignal?.aborted)throw new PolicyError('SOURCE_ABORTED');
   const parser=sourceParser(),cookies=parser.placementSessionCookies_(filterSession(session,now));
-  const signal=AbortSignal.timeout(240000),started=Date.now();
-  async function read(url) {
-    let target=parser.placementUrl_(url,BLOG,true);const visited=new Set();
-    for(let redirects=0;redirects<=12;redirects++) {
-      if(Date.now()-started>240000)throw new PolicyError('SOURCE_TIMEOUT');
-      if(!allowedSourceUrl(target.href))throw new PolicyError('UNSUPPORTED_SOURCE_REDIRECT');
-      const cookie=parser.placementCookieHeader_(cookies,target),identity=target.href+'|'+cookie;
-      if(visited.has(identity))throw new PolicyError('IITB_RECONNECT_REQUIRED');visited.add(identity);
+  const budget=AbortSignal.timeout(timeoutMs),signal=parentSignal?AbortSignal.any([parentSignal,budget]):budget;
+  const retryDelays=[500,1500];
+  function checkAbort() {
+    if(parentSignal?.aborted)throw new PolicyError('SOURCE_ABORTED');
+    if(budget.aborted)throw new PolicyError('SOURCE_TIMEOUT');
+  }
+  async function pause(ms) {
+    checkAbort();
+    try {await waitImpl(ms,{signal});}catch(error){checkAbort();throw error;}
+    checkAbort();
+  }
+  async function request(target) {
+    for(let attempt=0;;attempt++) {
+      checkAbort();
+      // Recompute from the same jar after every response, including transient errors
+      // which may rotate the official short session before a retry succeeds.
+      const cookie=parser.placementCookieHeader_(cookies,target);
       const headers={'User-Agent':parser.PLACEMENT_SOURCE_UA_,Accept:parser.PLACEMENT_SOURCE_ACCEPT_,'Accept-Language':'en-US,en;q=0.9',Referer:BLOG};
       if(cookie)headers.Cookie=cookie;
       let response;
-      try {response=await fetchImpl(target.href,{method:'GET',headers,redirect:'manual',signal:AbortSignal.any([signal,AbortSignal.timeout(30000)])});}
-      catch {throw new PolicyError('IITB_NETWORK_UNAVAILABLE');}
+      try {response=await fetchImpl(target.href,{method:'GET',headers,redirect:'manual',signal:AbortSignal.any([signal,AbortSignal.timeout(requestTimeoutMs)])});}
+      catch {
+        checkAbort();
+        if(attempt>=retryDelays.length)throw new PolicyError('IITB_NETWORK_UNAVAILABLE');
+        await pause(retryDelays[attempt]);continue;
+      }
+      checkAbort();
       parser.placementSetCookies_(cookies,{'set-cookie':response.headers.getSetCookie?.() || [response.headers.get('set-cookie')].filter(Boolean)},target);
+      if(![408,425,429,500,502,503,504].includes(response.status) || attempt>=retryDelays.length)return response;
+      const retryAfter=response.headers.get('retry-after');
+      const requested=retryAfter?( /^\d+(?:\.\d+)?$/.test(retryAfter)?Number(retryAfter)*1000:Math.max(0,Date.parse(retryAfter)-Date.now()) ):0;
+      // Never shorten a server's longer throttling instruction to squeeze in a retry.
+      if(Number.isFinite(requested) && requested>5000)return response;
+      await response.body?.cancel();
+      await pause(Math.max(retryDelays[attempt],Number.isFinite(requested)?requested:0));
+    }
+  }
+  async function read(url) {
+    let target=parser.placementUrl_(url,BLOG,true);const visited=new Set();
+    for(let redirects=0;redirects<=12;redirects++) {
+      checkAbort();
+      if(!allowedSourceUrl(target.href))throw new PolicyError('UNSUPPORTED_SOURCE_REDIRECT');
+      const cookie=parser.placementCookieHeader_(cookies,target),identity=target.href+'|'+cookie;
+      if(visited.has(identity))throw new PolicyError('IITB_RECONNECT_REQUIRED');visited.add(identity);
+      const response=await request(target);
       if([301,302,303,307,308].includes(response.status)) {
         const location=response.headers.get('location');await response.body?.cancel();
         if(!location || redirects===12)throw new PolicyError('IITB_RECONNECT_REQUIRED');
@@ -51,7 +84,10 @@ export async function readHttpSnapshot(session,{fetchImpl=fetch,lastSuccessfulCh
       if(response.status!==200) {await response.body?.cancel();throw new PolicyError('IITB_SOURCE_UNAVAILABLE');}
       const type=response.headers.get('content-type');
       if(type && !/^text\/html(?:\s*;|$)/i.test(type)){await response.body?.cancel();throw new PolicyError('INVALID_SOURCE_CONTENT');}
-      try{return parser.parsePlacementListing_(await boundedHtml(response),target.href);}
+      let text;
+      try {text=await boundedHtml(response);}catch(error){checkAbort();if(error instanceof PolicyError)throw error;throw new PolicyError('IITB_NETWORK_UNAVAILABLE');}
+      checkAbort();
+      try{return parser.parsePlacementListing_(text,target.href);}
       catch(error){if(error.placementReconnect)throw new PolicyError('IITB_RECONNECT_REQUIRED');throw error;}
     }
     throw new PolicyError('IITB_RECONNECT_REQUIRED');

@@ -77,3 +77,5 @@ existing five-minute trigger checks feed health; it does not fetch IITB or send
 another announcement stream. A local report older than fifteen minutes marks
 the source unhealthy and uses the existing one-notice failure episode. The local
 worker continues to use the same email and Calendar deduplication and owner.
+
+Successful local ingestion also returns the recorded source mode, exact local observation timestamp and freshness, allowing the reader to avoid another mode mutation. Lost responses must be reconciled by that exact observation and delivery status before claiming completion.

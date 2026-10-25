@@ -172,3 +172,23 @@ test('local setup rejects an unauthenticated bridge before any browser launch',a
     assert.equal(response.status,400);assert.equal(launches,0);assert.equal((await response.text()).includes(fixtureEnv.IITB_HMAC_SECRET),false);
   } finally {helper.shutdown();}
 });
+
+test('Bridge distinguishes an authenticated busy response and never retries a mutation automatically',async()=>{
+  const config=bridgeConfig(fixtureEnv);let calls=0;
+  await assert.rejects(bridgeCall(config,'status',{},async()=>{calls++;return Response.json({ok:false,error:'busy'});}),e=>e.code==='BRIDGE_BUSY');
+  assert.equal(calls,1);calls=0;
+  await assert.rejects(bridgeCall(config,'ingest_local_snapshot',{},async()=>{calls++;throw new Error('Synthetic lost response');}),e=>e.code==='BRIDGE_UNREACHABLE');
+  assert.equal(calls,1);
+});
+test('Bridge caller cancellation prevents a request and interrupts an in-flight read',async()=>{
+  const config=bridgeConfig(fixtureEnv),cancelled=new AbortController();cancelled.abort();let calls=0;
+  await assert.rejects(bridgeCall(config,'status',{},async()=>{calls++;return Response.json({ok:true});},{signal:cancelled.signal}),e=>e.code==='BRIDGE_ABORTED');assert.equal(calls,0);
+  const controller=new AbortController();
+  await assert.rejects(bridgeCall(config,'status',{},async(_url,options)=>{
+    const pending=new Promise((_resolve,reject)=>options.signal.addEventListener('abort',()=>reject(options.signal.reason),{once:true}));
+    controller.abort();return pending;
+  },{signal:controller.signal,timeoutMs:1000}),e=>e.code==='BRIDGE_ABORTED');
+  await assert.rejects(bridgeCall(config,'status',{},async(_url,options)=>{
+    return new Promise((_resolve,reject)=>{options.signal.addEventListener('abort',()=>reject(options.signal.reason),{once:true});setTimeout(()=>{},15);});
+  },{timeoutMs:5}),e=>e.code==='BRIDGE_UNREACHABLE');
+});
