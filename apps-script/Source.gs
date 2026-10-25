@@ -169,7 +169,12 @@ function placementFetch_(url, cookies, startedAt) {
     if (cookieHeader) headers.Cookie = cookieHeader;
     var response;
     try { response = UrlFetchApp.fetch(next.href,{method:'get',headers:headers,followRedirects:false,muteHttpExceptions:true,validateHttpsCertificates:true}); }
-    catch (error) { throw new Error('IITB could not be reached. Previous posts and successful-check time were preserved.'); }
+    catch (error) {
+      var networkError=new Error('IITB could not be reached. Previous posts and successful-check time were preserved.');
+      var detail=String(error && error.message || '');
+      networkError.placementFailureReason=/quota|too many times|limit exceeded/i.test(detail)?'google_quota':/certificate|SSL|TLS/i.test(detail)?'tls_failure':/timed? out|timeout/i.test(detail)?'network_timeout':/DNS|resolve|address unavailable/i.test(detail)?'network_address_unavailable':'network_unreachable';
+      throw networkError;
+    }
     placementCheckTime_(startedAt);
     var status = response.getResponseCode(), responseHeaders = response.getAllHeaders();
     placementTrace_(next,status,!!cookieHeader);

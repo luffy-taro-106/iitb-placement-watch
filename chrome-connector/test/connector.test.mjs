@@ -248,3 +248,15 @@ test('manifest has no automatic browser access and local transport CSP permits o
   assert.match(csp,/connect-src https:\/\/script\.google\.com https:\/\/script\.googleusercontent\.com;/);
   assert.equal(csp.includes('iitb'),false);
 });
+
+test('Five-minute cloud activation passes strict readback and reports the actual cadence',async()=>{
+  assert.equal(validateBridgeResult('install_monitor',installReply({interval_minutes:5}),NOW).interval_minutes,5);
+  const result=validateBridgeResult('status',statusReply({installed:true,interval_minutes:5,monitor_interval_minutes:5}),NOW);
+  assert.equal(result.monitor_interval_minutes,5);
+});
+
+test('Local reconnection saves the approved session once, revokes access, and never claims Google source activation',async()=>{
+ const f=fixture(),result=await connect({...config(),source_mode:'local_https'},f.deps);
+ assert.equal(result.saved,true);assert.equal(result.activated,false);assert.equal(result.local_verification_pending,true);assert.equal(result.permissions_revoked,true);
+ assert.equal(f.bodies.some(b=>b.action==='install_monitor'),false);
+});

@@ -9,7 +9,7 @@ This optional connector reuses the IITB session in the Chrome profile where you 
 3. Open this extension from Chrome’s extension menu, then choose **Open connection page**. A full page keeps the attempt open while it finishes.
 4. A preconfigured private package already contains your monitor’s setup values and hides these settings. A generic package shows fields for the private Google monitor URL and connection key. These are Google setup values; never enter an IITB password or phone OTP here.
 5. Read the consent text and click **Connect and save once**. Chrome asks for temporary access to only the two official IITB hosts and the two Google Apps Script hosts. The connector checks a signed monitor status and verifies a fresh credentialed blog response contains announcement articles before reading any cookies.
-6. Keep the connection page open. After saving the scoped session, Connect asks Google to perform its own complete blog read and activate the single 30-minute monitor. It reports success only after Google confirms the schedule and a fresh cloud source verification. Automatic emails and calendar updates then run on Google with Chrome closed.
+6. Keep the connection page open. After saving the scoped session, Connect asks Google to perform its own complete blog read and activate the single 5-minute monitor. It reports success only after Google confirms the schedule and a fresh cloud source verification. Automatic emails and calendar updates then run on Google with Chrome closed.
 7. The activation attempt has a 90-second window, including one installation request and any signed status recovery. If completion is still uncertain, use **Check activation** on this page after a short wait. That button requests only Google access and checks status; it never reads or transfers IITB cookies. A private package reloads its connection key when you click; manual setup may require entering that private key again. Do not repeat Connect while the previous activation is unresolved. A confirmed cloud-access failure permits a deliberate retry after reconnecting on IITB’s official page.
 8. Remove this extension after confirmed activation. Its permissions are revoked after every attempt, including failures. If Chrome cannot confirm revocation, the page tells you to remove the extension. Closing the connection page mid-request can interrupt cleanup; remove the extension if you do so.
 
@@ -30,3 +30,9 @@ The signed bridge POST follows the existing HMAC-SHA256 envelope, replay nonce, 
 Run `node --test chrome-connector/test/*.test.mjs` from the repository root after installing the existing development dependencies. The tests use synthetic HTML, synthetic cookies, mocked Chrome APIs, and mocked network responses. They never start a browser or contact IITB or Google. Live acceptance and activation must be tested by the user’s explicit Connect action; it includes the Google source check.
 
 Chrome documentation: [manual unpacked installation](https://developer.chrome.com/docs/extensions/get-started/tutorial/hello-world#load-unpacked), [cookies API](https://developer.chrome.com/docs/extensions/reference/api/cookies), [optional permissions](https://developer.chrome.com/docs/extensions/develop/concepts/declare-permissions), and [extension network requests](https://developer.chrome.com/docs/extensions/develop/concepts/network-requests).
+
+For an explicitly chosen local network reader, the private owner-only package may
+set `source_mode:"local_https"`. Connect then saves the approved session once and
+reports that local verification is pending. It does not claim that Google can
+reach an institute-only source. The separately installed Mac job verifies that
+session on its next five-minute run; Chrome can be closed after verification.

@@ -32,7 +32,7 @@ function harness(options={}) {
     Gmail:{Users:{getProfile(){identityReads++;return {emailAddress:OWNER};}}},Calendar:{CalendarList:{get:()=>({id:OWNER,accessRole:'owner'})}},
     ContentService:{MimeType:{JSON:'JSON',TEXT:'TEXT'},createTextOutput:value=>({value,setMimeType(){return this;}})},
     Utilities:{Charset:{UTF_8:'UTF-8'},DigestAlgorithm:{SHA_256:'sha256'},computeDigest:(_algorithm,value)=>[...createHash('sha256').update(value).digest()],computeHmacSha256Signature:(value,key)=>[...createHmac('sha256',key).update(value).digest()]},
-    ScriptApp:{EventType:{CLOCK:EVENT_CLOCK},TriggerSource:{CLOCK:SOURCE_CLOCK},getProjectTriggers:()=>triggers.slice(),newTrigger(handler){assert.equal(handler,'runCheck');let minutes=null;const builder={timeBased(){return builder;},everyMinutes(value){assert.equal(value,30);minutes=value;return builder;},create(){assert.equal(minutes,30);const item=trigger('fixture-'+(++created));triggers.push(item);return item;}};return builder;},deleteTrigger(item){deleted++;triggers=triggers.filter(t=>t!==item);}},
+    ScriptApp:{EventType:{CLOCK:EVENT_CLOCK},TriggerSource:{CLOCK:SOURCE_CLOCK},getProjectTriggers:()=>triggers.slice(),newTrigger(handler){assert.equal(handler,'runCheck');let minutes=null;const builder={timeBased(){return builder;},everyMinutes(value){assert.ok([5,30].includes(value));minutes=value;return builder;},create(){assert.ok([5,30].includes(minutes));const item=trigger('fixture-'+(++created));triggers.push(item);return item;}};return builder;},deleteTrigger(item){deleted++;triggers=triggers.filter(t=>t!==item);}},
     UrlFetchApp:{fetch(url,request){sourceReads++;assert.equal(url,BLOG);assert.equal(request.method,'get');assert.match(request.headers.Cookie,/campus=synthetic-cookie/);now+=100;
       const status=mode==='source_failure'?401:200;
       const text=mode==='source_failure'?'<h1>Unauthorized</h1>':article;
@@ -48,6 +48,7 @@ function harness(options={}) {
   context.ingestSnapshot_=(snapshot)=>{
     assert.equal(snapshot.source_url,BLOG);assert.equal(snapshot.complete,true);assert.equal(snapshot.posts.length,1);
     if(mode==='delivery_failure')throw new Error('Synthetic delivery failure');
+    if(snapshot.session)context.saveSession_(snapshot.session,snapshot.observed_at);
     const state=context.loadState_();state.last_successful_check=snapshot.observed_at;state.last_error=null;
     if(mode==='unresolved_email')state.email_attempt={reference:'synthetic-reference'};
     if(mode==='unresolved_calendar')state.pending=[{calendar_complete:false}];
@@ -129,14 +130,14 @@ test('Cloud failures and unfinished native delivery cannot create a schedule, an
   assert.deepEqual(unknown.call('install_monitor'),{ok:false,error:'operation_failed'});assert.equal(unknown.stats().created,0);
 });
 
-test('Successful activation reads the whole cloud source and is idempotent only for a proven 30-minute CLOCK trigger',()=>{
+test('Successful activation reads the whole cloud source and is idempotent only for a proven 5-minute CLOCK trigger',()=>{
   const h=harness(),first=h.call('install_monitor');
   assert.deepEqual(Object.keys(first).sort(),['cloud_source_verified_at','installed','interval_minutes','last_cloud_source_check','ok']);
-  assert.equal(first.ok,true);assert.equal(first.installed,true);assert.equal(first.interval_minutes,30);
+  assert.equal(first.ok,true);assert.equal(first.installed,true);assert.equal(first.interval_minutes,5);
   assert.equal(first.cloud_source_verified_at,new Date(NOW+100).toISOString());assert.equal(h.stats().sourceReads,1);assert.equal(h.stats().created,1);
   h.advance(1000);const second=h.call('install_monitor');assert.equal(second.installed,true);assert.equal(h.stats().created,1);assert.equal(h.stats().sourceReads,2);
   assert.ok(Date.parse(second.cloud_source_verified_at)>Date.parse(first.cloud_source_verified_at));
-  const status=h.call('status');assert.equal(status.monitor_installed,true);assert.equal(status.interval_minutes,30);assert.equal(status.monitor_interval_minutes,30);assert.equal(status.session_status,'cloud_verified');
+  const status=h.call('status');assert.equal(status.monitor_installed,true);assert.equal(status.interval_minutes,5);assert.equal(status.monitor_interval_minutes,5);assert.equal(status.session_status,'cloud_verified');
   assert.equal(JSON.stringify(status).includes('synthetic-cookie'),false);assert.equal(JSON.stringify(first).includes('fixture-'),false);
   h.values.STATE_FILE_ID.last_error='provider-private-details';const sanitized=h.call('status');assert.equal(sanitized.last_error,'operation_failed');assert.equal(sanitized.needs_attention,true);assert.equal(JSON.stringify(sanitized).includes('provider-private-details'),false);h.values.STATE_FILE_ID.last_error=null;
   h.setTriggers([h.triggers[0],h.trigger('duplicate')]);const duplicate=h.call('install_monitor');assert.equal(duplicate.error,'duplicate_monitor_triggers');assert.equal(h.stats().sourceReads,2);
@@ -146,7 +147,7 @@ test('Successful activation reads the whole cloud source and is idempotent only 
 test('Unknown intervals, IDs, event types, and trigger sources never count as an installation',()=>{
   for(const kind of ['unknown','different_id','wrong_interval','wrong_event','wrong_source']) {
     const h=harness(),item=h.trigger('existing','runCheck',kind==='wrong_event'?'ON_OPEN':EVENT_CLOCK,kind==='wrong_source'?'SPREADSHEETS':SOURCE_CLOCK);h.setTriggers([item]);
-    if(kind!=='unknown')h.knowTrigger(kind==='different_id'?h.trigger('not-existing'):item,kind==='wrong_interval'?5:30);
+    if(kind!=='unknown')h.knowTrigger(kind==='different_id'?h.trigger('not-existing'):item,kind==='wrong_interval'?10:30);
     assert.equal(h.call('install_monitor').error,'monitor_verification_required',kind);assert.equal(h.stats().created,0);assert.equal(h.stats().sourceReads,0);
     assert.equal(h.call('status').monitor_installed,false);assert.equal(h.call('status').monitor_interval_minutes,null);
   }
@@ -181,4 +182,44 @@ test('Even an apparent successful reader result cannot reuse historical or stale
     h.context.readPlacementSource_=()=>({source_url:BLOG,complete:true,observed_at:new Date(NOW).toISOString(),posts:[{}]});
     assert.equal(h.call('install_monitor').error,'source_connection_required');assert.equal(h.stats().created,0);
   }
+});
+
+test('Authenticated cadence migration retains outage and delivery history and replaces only the recorded legacy trigger',()=>{
+  const h=harness({mode:'source_failure'}),old=h.trigger('legacy');h.setTriggers([old]);h.knowTrigger(old,30);
+  h.values.STATE_FILE_ID.last_error='source_check_failed';
+  h.values.STATE_FILE_ID.deliveries=[{email_id:'already-sent'}];
+  const forged=h.envelope('configure_monitor',{interval_minutes:5});forged.signature='0'.repeat(64);
+  assert.equal(h.post(forged).error,'authentication_failed');assert.equal(h.stats().created,0);
+  for(const payload of [{},{interval_minutes:1},{interval_minutes:30},{interval_minutes:5,url:BLOG}]) {
+    assert.equal(h.call('configure_monitor',payload).error,'invalid_payload');
+  }
+  assert.deepEqual(h.call('configure_monitor',{interval_minutes:5}),{ok:true,monitor_installed:true,monitor_interval_minutes:5});
+  assert.equal(h.stats().created,1);assert.equal(h.stats().deleted,1);assert.equal(h.stats().sourceReads,0);
+  assert.deepEqual(h.values.STATE_FILE_ID.deliveries,[{email_id:'already-sent'}]);
+  const status=h.call('status');assert.equal(status.monitor_interval_minutes,5);assert.equal(status.needs_attention,true);assert.equal(status.last_error,'source_check_failed');
+  assert.equal(h.call('configure_monitor',{interval_minutes:5}).ok,true);assert.equal(h.stats().created,1);
+  const fresh=harness();assert.equal(fresh.call('configure_monitor',{interval_minutes:5}).error,'monitor_verification_required');assert.equal(fresh.stats().created,0);
+  const other=harness({effectiveOwner:'other@example.test'});assert.equal(other.call('configure_monitor',{interval_minutes:5}).error,'wrong_account');
+});
+
+test('Cadence replacement rolls back before removing the legacy trigger if metadata persistence fails',()=>{
+  for(const metadataFailure of ['throw','corrupt']) {
+    const h=harness({metadataFailure}),old=h.trigger('legacy');h.setTriggers([old]);
+    h.properties.set('MONITOR_INSTALLATION_JSON',JSON.stringify({version:1,trigger_id:'legacy',handler:'runCheck',interval_minutes:30,owner:OWNER}));
+    assert.equal(h.call('configure_monitor',{interval_minutes:5}).ok,false);
+    assert.deepEqual(h.triggers,[old]);assert.equal(h.stats().created,1);assert.equal(h.stats().deleted,1);
+  }
+});
+
+test('Local network mode requires a fresh signed complete snapshot and never substitutes it for cloud proof',()=>{
+ const h=harness();h.call('install_monitor');
+ assert.equal(h.call('configure_source',{mode:'local_https'}).error,'source_connection_required');
+ assert.equal(h.call('configure_source',{mode:'some_other_host'}).error,'invalid_payload');
+ const payload={source_url:BLOG,complete:true,posts:[{}],observed_at:new Date(NOW+100).toISOString(),session:session()};
+ const forged=h.envelope('ingest_local_snapshot',payload);forged.signature='0'.repeat(64);assert.equal(h.post(forged).error,'authentication_failed');
+ assert.equal(h.call('ingest_local_snapshot',payload).ok,true);assert.equal(h.call('source_status').mode,'google_https');
+ assert.equal(h.call('status').cloud_source_verified_at,null);
+ assert.equal(h.call('configure_source',{mode:'local_https'}).mode,'local_https');
+ const reads=h.stats().sourceReads;h.setMode('source_failure');assert.equal(h.context.runCheck().ok,true);assert.equal(h.stats().sourceReads,reads);
+ h.advance(16*60000);assert.equal(h.call('source_status').local_source_fresh,false);assert.equal(h.context.runCheck().ok,false);assert.equal(h.stats().notifications,1);assert.equal(h.stats().sourceReads,reads);
 });

@@ -16,7 +16,7 @@ const messages={
   BRIDGE_ACCOUNT_MISMATCH:'Your Google monitor is not connected to the expected account. Automatic reminders have not been activated.',
   CLOUD_SOURCE_UNAVAILABLE:'Google could not read the placement blog with this saved session. Automatic reminders have not been activated. Chrome’s remembered login may not be usable from Google.',
   DELIVERY_REVIEW_REQUIRED:'An earlier email or calendar action needs review before automatic monitoring can start.',
-  MONITOR_CONFIGURATION_REQUIRED:'Google could not confirm a single half-hour schedule. Automatic monitoring has not been confirmed.',
+  MONITOR_CONFIGURATION_REQUIRED:'Google could not confirm a single placement-check schedule. Automatic monitoring has not been confirmed.',
   ACTIVATION_UNCONFIRMED:'Activation may still be running on Google. Keep this page open and use Check activation after a short wait. It checks progress without sending your login again. Automatic reminders are not yet confirmed.',
   SESSION_SAVE_UNCONFIRMED:'The session save could not be confirmed, so this connector has not requested activation or sent the session again. Once the Google connection is available, you can retry Connect.',
   PARTITIONED_SESSION_UNSUPPORTED:'This Chrome session uses a cookie format this monitor cannot safely copy. It was not saved.',
@@ -28,12 +28,16 @@ const messages={
   REMOVE_EXTENSION_REQUIRED:'Chrome could not confirm removal of this connector’s permissions. Remove this extension from Chrome before continuing.',
   CONNECTION_FAILED:'The connection could not finish. No successful connection has been confirmed.'
 };
-let busy=false,pendingActivation=null,completed=false;
+let busy=false,pendingActivation=null,completed=false,localSource=false;
 const googleTransport=createGoogleTransport(document.getElementById('bridgeTransport'));
 window.addEventListener('pagehide',()=>{secret.value='';void revokePermissions();});
 function reportSuccess(result) {
-  if (result.activated===true && result.cloud_verified===true && result.interval_minutes===30 && typeof result.cloud_source_verified_at==='string') {
-    output.textContent='Automatic placement checks every 30 minutes, email reminders, and calendar meeting updates are activated. Google verified access to the blog. Chrome can be closed and this extension can be removed.';
+  if(result.saved===true && result.local_verification_pending===true) {
+    output.textContent='Login saved. The Mac checker will verify access on its next 5-minute run. Keep the Mac awake and connected to IITB or its VPN. You can close Chrome after that check succeeds.';
+    pendingActivation=null;completed=true;checkButton.hidden=true;return;
+  }
+  if (result.activated===true && result.cloud_verified===true && [5,30].includes(result.interval_minutes) && typeof result.cloud_source_verified_at==='string') {
+    output.textContent='Automatic placement checks every '+result.interval_minutes+' minutes, email reminders, and calendar meeting updates are activated. Google verified access to the blog. Chrome can be closed and this extension can be removed.';
     pendingActivation=null;completed=true;checkButton.hidden=true;return;
   }
   output.textContent=messages.ACTIVATION_UNCONFIRMED;
@@ -60,12 +64,12 @@ form.addEventListener('submit',async event=>{
   event.preventDefault();
   if (busy || !form.reportValidity() || !document.getElementById('consent').checked) return;
   busy=true;button.disabled=true;checkButton.disabled=true;output.textContent='Checking your private monitor and remembered IITB access…';
-  const config={bridge_url:bridge.value.trim(),hmac_secret:secret.value};
+  const config={bridge_url:bridge.value.trim(),hmac_secret:secret.value,...(localSource?{source_mode:'local_https'}:{})};
   const target=config.bridge_url;
   secret.value='';
   try {
     const result=await connect(config,{fetchImpl:(url,options)=>url===BLOG?fetch(url,options):googleTransport.fetch(url,options),
-      onStage:()=>{output.textContent='Session saved. Google is verifying cloud access and activating the 30-minute checks. Keep this page open…';}});
+      onStage:()=>{output.textContent=localSource?'Session saved for the local Mac checker…':'Session saved. Google is verifying cloud access and activating the 5-minute checks. Keep this page open…';}});
     reportSuccess(result);
   } catch(error) {reportFailure(error,target);}
   finally {config.hmac_secret='';await prepareRetry();busy=false;button.disabled=completed||!!pendingActivation;checkButton.disabled=false;}
@@ -107,11 +111,16 @@ async function initialize() {
   let configuration=null;
   try {
     configuration=await loadPrivateConfig();
-    if (configuration) {bridge.value=configuration.bridge_url;secret.value=configuration.hmac_secret;privateSetup.hidden=true;}
+    if (configuration) {localSource=configuration.source_mode==='local_https';bridge.value=configuration.bridge_url;secret.value=configuration.hmac_secret;privateSetup.hidden=true;}
     else privateSetup.hidden=false;
   } catch { /* Manual configuration remains available. Never show provider exceptions. */ }
   finally { if (configuration && typeof configuration==='object') configuration.hmac_secret='';configuration=null; }
   output.textContent='Ready. Open the official blog first, then click Connect to save this session and activate automatic reminders.';
+  if(localSource) {
+    document.getElementById('runtimeInfo').textContent='Your Mac will check the blog every 5 minutes while awake and connected to IITB or its VPN. Google sends the emails and saves calendar events. This connector only refreshes the login once; Chrome can then be closed.';
+    output.textContent='Ready. Open the official blog, then click Save login for Mac checker. The Mac verifies this login on its next check.';
+    button.textContent='Save login for Mac checker';
+  }
   button.disabled=false;
 }
 void initialize();

@@ -23,7 +23,8 @@ export function validateConfig(config) {
   if (url.origin !== 'https://script.google.com' || !/^\/macros\/s\/[a-z\d_-]+\/exec$/i.test(url.pathname) ||
       url.username || url.password || url.search || url.hash || typeof config?.hmac_secret !== 'string' ||
       config.hmac_secret.length < 32 || config.hmac_secret.length > 256) fail('INVALID_CONFIGURATION');
-  return {bridge_url:url.href, hmac_secret:config.hmac_secret};
+  if(config.source_mode!==undefined && config.source_mode!=='local_https')fail('INVALID_CONFIGURATION');
+  return {bridge_url:url.href, hmac_secret:config.hmac_secret,...(config.source_mode?{source_mode:config.source_mode}:{})};
 }
 export function canonical(action, nonce, issued_at, payload) {
   if (!['status','save_session','install_monitor'].includes(action) || !/^[a-f\d]{32}$/.test(nonce) || !Number.isSafeInteger(issued_at) ||
@@ -92,10 +93,10 @@ export function validateBridgeResult(action,result,now=Date.now()) {
   }
   if (action==='install_monitor') {
     if (!objectWithKeys(result,['ok','installed','interval_minutes','cloud_source_verified_at','last_cloud_source_check']) ||
-        result.installed!==true || result.interval_minutes!==30) fail('BRIDGE_INVALID_RESPONSE');
+        result.installed!==true || ![5,30].includes(result.interval_minutes)) fail('BRIDGE_INVALID_RESPONSE');
     validInstant(result.cloud_source_verified_at,now);
     if (result.last_cloud_source_check!==undefined) validInstant(result.last_cloud_source_check,now);
-    return {ok:true,installed:true,interval_minutes:30,cloud_source_verified_at:result.cloud_source_verified_at};
+    return {ok:true,installed:true,interval_minutes:result.interval_minutes || result.monitor_interval_minutes,cloud_source_verified_at:result.cloud_source_verified_at};
   }
   if (action!=='status') fail('BRIDGE_INVALID_RESPONSE');
   const allowed=['ok','connected','session_status','session_verified_at','last_successful_check','last_error','post_count','pending_count','meeting_count','delivery_count',
@@ -103,7 +104,7 @@ export function validateBridgeResult(action,result,now=Date.now()) {
   if (!objectWithKeys(result,allowed) || typeof result.monitor_installed!=='boolean' ||
       typeof result.connected!=='boolean' || typeof result.needs_attention!=='boolean' || !Object.hasOwn(result,'last_error') ||
       !Object.hasOwn(result,'cloud_source_verified_at') || !Object.hasOwn(result,'monitor_interval_minutes') ||
-      result.monitor_interval_minutes!==(result.monitor_installed?30:null)) fail('BRIDGE_INVALID_RESPONSE');
+      (result.monitor_installed?![5,30].includes(result.monitor_interval_minutes):result.monitor_interval_minutes!==null)) fail('BRIDGE_INVALID_RESPONSE');
   if (result.interval_minutes!==undefined && result.interval_minutes!==result.monitor_interval_minutes) fail('BRIDGE_INVALID_RESPONSE');
   for (const field of ['connected','needs_attention']) if (result[field]!==undefined && typeof result[field]!=='boolean') fail('BRIDGE_INVALID_RESPONSE');
   if (result.session_status!==undefined && !['missing','saved_not_live_verified','expired','live_verified','cloud_verified'].includes(result.session_status)) fail('BRIDGE_INVALID_RESPONSE');
@@ -204,13 +205,13 @@ export async function revokePermissions(chromeImpl=globalThis.chrome) {
 }
 function activated(result,notBefore,now) {
   const installed=result.installed===true || result.monitor_installed===true;
-  const interval=result.interval_minutes===30 || result.monitor_interval_minutes===30;
+  const interval=[5,30].includes(result.interval_minutes || result.monitor_interval_minutes);
   if (!installed || !interval || (result.monitor_installed!==undefined && result.healthy!==true) || !result.cloud_source_verified_at) return false;
   const proof=validInstant(result.cloud_source_verified_at,now);
   return proof>=notBefore-60000;
 }
 function activationResult(result) {
-  return {activated:true,cloud_verified:true,interval_minutes:30,cloud_source_verified_at:result.cloud_source_verified_at};
+  return {activated:true,cloud_verified:true,interval_minutes:result.interval_minutes || result.monitor_interval_minutes,cloud_source_verified_at:result.cloud_source_verified_at};
 }
 function clock(deps) { return (deps.monotonicNow || (()=>performance.now()))(); }
 async function pause(ms,deps) {
@@ -298,8 +299,9 @@ export async function connect(input, deps={}) {
       if (!stored?.connected || stored.session_verified_at!==candidateInstant) fail('SESSION_SAVE_UNCONFIRMED');
     }
     savedAt=candidateTime;
-    deps.onStage?.('activation');
-    result={saved:true,source_verified_in_chrome:true,cookie_count:session.cookies.length,...await activate(config,savedAt,deps)};
+    deps.onStage?.(config.source_mode==='local_https'?'local_verification':'activation');
+    if(config.source_mode==='local_https')result={saved:true,source_verified_in_chrome:true,activated:false,local_verification_pending:true};
+    else result={saved:true,source_verified_in_chrome:true,cookie_count:session.cookies.length,...await activate(config,savedAt,deps)};
   } catch(error) {
     if (error instanceof ConnectorError) {
       if (savedAt!==null && ['ACTIVATION_UNCONFIRMED','BRIDGE_UNAVAILABLE','BRIDGE_BUSY','BRIDGE_INVALID_RESPONSE'].includes(error.code)) error.activationNotBefore=new Date(savedAt).toISOString();

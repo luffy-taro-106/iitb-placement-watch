@@ -12,6 +12,13 @@ function validatePosts_(payload) {
     return {id:post.id,title:normalized_(post.title),text:normalized_(post.text),published:post.published,url:post.url,links:links};
   });
 }
+function sameAnnouncementContent_(left,right) {
+  if(!left || typeof left.text!=='string' || !Array.isArray(left.links))return false;
+  function content(post) {
+    return JSON.stringify([String(post.title).replace(/\s+/g,' ').trim(),post.text.replace(/\s+/g,' ').trim(),Array.from(new Set(post.links.map(function(link){return link.url;}))).sort()]);
+  }
+  return content(left)===content(right);
+}
 function postFingerprint_(post) { return sha256_(JSON.stringify([post.title,post.text,post.links.map(function(a){return a.url;}).sort()])); }
 function validateAnnouncementRecipients_(recipients,owner) {
   if(!Array.isArray(recipients) || !recipients.length || recipients.length>10)fail_('invalid_payload');
@@ -38,7 +45,7 @@ function ingestSnapshot_(payload,configuration) {
   posts.forEach(function(post){
     var old=state.posts[post.id], fingerprint=postFingerprint_(post), legacy=old && /^[a-f0-9]{8}$/.test(old.fingerprint || '');
     var isNew=!old && Date.parse(post.published)>Date.parse(state.baseline_cutoff);
-    if(isNew || (old && !legacy && old.fingerprint!==fingerprint)) {
+    if(isNew || (old && !legacy && old.fingerprint!==fingerprint && !sameAnnouncementContent_(old,post))) {
       if(typeof queueWhatsAppPost_==='function')queueWhatsAppPost_(state,Object.assign({},post,{fingerprint:fingerprint}),configuration,isNew);
       // A newer revision also supersedes unfinished calendar work from an already mailed revision.
       // Sent history and an uncertain email_attempt remain independent and are still recovered below.

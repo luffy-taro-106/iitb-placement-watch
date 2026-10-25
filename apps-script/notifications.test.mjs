@@ -96,3 +96,11 @@ test('Non-ASCII announcement titles survive MIME encoding and unexpected recipie
   const wrongRecipient=clone(message);wrongRecipient.payload.headers.find(h=>h.name==='To').value+=', outsider@example.test';assert.throws(()=>h.context.verifySentOwner_(wrongRecipient,OWNER,attempt),/uncertain_email_delivery/);
   const wrongSubject=clone(message);wrongSubject.payload.headers.find(h=>h.name==='Subject').value='Generic update';assert.throws(()=>h.context.verifySentOwner_(wrongSubject,OWNER,attempt),/uncertain_email_delivery/);
 });
+
+test('Changing reader formatting or duplicated header links does not re-mail a previously delivered announcement',()=>{
+ const h=harness(),post=sony();h.ingest([post]);assert.equal(h.stats().sends,1);
+ h.ingest([{...post,text:post.text.replace(/\n/g,'   '),links:[...post.links,...post.links]}]);
+ assert.equal(h.stats().sends,1);assert.equal(h.data.STATE_FILE_ID.pending.length,0);
+ h.ingest([{...post,text:post.text.replace('14th October','15th October')}]);
+ assert.equal(h.stats().sends,2);assert.equal([...h.events.values()][0].start.dateTime,'2026-10-15T18:29:00.000Z');
+});
