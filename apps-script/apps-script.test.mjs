@@ -122,6 +122,8 @@ context.ingestSnapshot_(snapshot([retryMeeting]),config);assert.equal(sends,7);a
 context.readPlacementSource_=()=>{throw new Error('fixture source outage');};
 context.runCheck();context.runCheck();assert.equal(sends,8,'Source failures notify once');assert.equal(state.last_error,'source_check_failed');
 context.readPlacementSource_=()=>snapshot([post(502,'Another announcement','New notice.')]);
+assert.equal(context.runCheck().error,'source_retry_wait');
+properties.deleteProperty('CLOUD_SOURCE_RETRY_JSON'); // Simulate the next allowed retry in this fixed-clock fixture.
 assert.equal(context.runCheck().ok,true);assert.equal(state.failure,null);assert.equal(state.last_error,null);
 context.loadConfiguration_=()=>{throw new Error('wrong_account');};
 context.runCheck();assert.equal(sends,8,'Account errors must not cause provider writes');

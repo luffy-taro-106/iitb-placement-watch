@@ -24,7 +24,7 @@ function validInstant_(value, recent) {
 }
 function verifyEnvelope_(body, properties, nowSeconds) {
   requireObject_(body);
-  if (!['get_session', 'save_session', 'ingest_snapshot', 'status', 'install_monitor', 'connection_diagnostics', 'configure_notifications', 'configure_monitor', 'configure_source', 'source_status', 'ingest_local_snapshot', 'resend_announcement','configure_whatsapp','whatsapp_status'].includes(body.action) || !/^[a-f0-9]{32}$/.test(body.nonce || '') || !Number.isSafeInteger(body.issued_at)) fail_('invalid_request');
+  if (!['get_session', 'save_session', 'ingest_snapshot', 'status', 'install_monitor', 'connection_diagnostics', 'configure_notifications', 'configure_monitor', 'configure_source', 'source_status', 'probe_cloud_source', 'restore_cloud_monitor', 'ingest_local_snapshot', 'resend_announcement','configure_whatsapp','whatsapp_status'].includes(body.action) || !/^[a-f0-9]{32}$/.test(body.nonce || '') || !Number.isSafeInteger(body.issued_at)) fail_('invalid_request');
   if (nowSeconds - body.issued_at > 300 || body.issued_at - nowSeconds > 60) fail_('expired_request');
   requireObject_(body.payload);
   var secret = properties.getProperty('BRIDGE_SECRET');
@@ -78,6 +78,31 @@ function doPost(e) {
       if(Object.keys(request.payload).length)fail_('invalid_payload');
       return jsonOutput_(sourceStatus_());
     }
+    if (request.action === 'restore_cloud_monitor') {
+      requireExecutionOwner_(configuration);
+      if(Object.keys(request.payload).length)fail_('invalid_payload');
+      var recorded=inspectMonitor_(configuration);
+      if(recorded.error || !recorded.installed || recorded.interval_minutes!==5)fail_('monitor_verification_required');
+      if(sourceStatus_().mode!=='google_https')properties.deleteProperty('CLOUD_SOURCE_RETRY_JSON');
+      properties.setProperty('PLACEMENT_SOURCE_MODE','google_https');
+      var proof=cloudSourceVerifiedAt_(privateRead_('SESSION_FILE_ID')),fresh=!!proof && Date.now()-Date.parse(proof)>=-60000 && Date.now()-Date.parse(proof)<=10*60000;
+      return jsonOutput_({ok:true,mode:'google_https',monitor_interval_minutes:5,source_verified:fresh,awaiting_cloud_read:!fresh});
+    }
+    if (request.action === 'probe_cloud_source') {
+      requireExecutionOwner_(configuration);
+      if(Object.keys(request.payload).length)fail_('invalid_payload');
+      try {
+        var cloudSnapshot=readPlacementSource_();
+        var cloudProbe={ok:true,reachable:true,post_count:cloudSnapshot.posts.length,cloud_source_verified_at:cloudSnapshot.observed_at};
+        properties.setProperty('CLOUD_SOURCE_PROBE_JSON',JSON.stringify(cloudProbe));
+        return jsonOutput_(cloudProbe);
+      } catch(probeError) {
+        var probeReasons=['google_quota','tls_failure','network_timeout','network_address_unavailable','network_unreachable'];
+        var cloudProbeFailure={ok:true,reachable:false,reason:probeError.placementReconnect?'signin_required':probeReasons.includes(probeError.placementFailureReason)?probeError.placementFailureReason:'source_check_failed',observed_at:new Date().toISOString()};
+        properties.setProperty('CLOUD_SOURCE_PROBE_JSON',JSON.stringify(cloudProbeFailure));
+        return jsonOutput_(cloudProbeFailure);
+      }
+    }
     if (request.action === 'ingest_local_snapshot') {
       requireExecutionOwner_(configuration);
       if(Object.keys(request.payload).some(function(k){return !['source_url','posts','complete','observed_at','session'].includes(k);}) || !request.payload.session)fail_('invalid_payload');
@@ -91,10 +116,15 @@ function doPost(e) {
     }
     if (request.action === 'configure_source') {
       requireExecutionOwner_(configuration);
-      if(Object.keys(request.payload).length!==1 || request.payload.mode!=='local_https')fail_('invalid_payload');
+      if(Object.keys(request.payload).length!==1 || !['local_https','google_https'].includes(request.payload.mode))fail_('invalid_payload');
       var source=sourceStatus_();
-      if(!source.local_source_fresh || !inspectMonitor_(configuration).installed)fail_('source_connection_required');
-      properties.setProperty('PLACEMENT_SOURCE_MODE','local_https');
+      if(!inspectMonitor_(configuration).installed)fail_('source_connection_required');
+      if(request.payload.mode==='local_https' && !source.local_source_fresh)fail_('source_connection_required');
+      if(request.payload.mode==='google_https') {
+        var cloudSession=privateRead_('SESSION_FILE_ID'),cloudProof=cloudSourceVerifiedAt_(cloudSession),cloudAge=Date.now()-Date.parse(cloudProof);
+        if(!sessionConnected_(cloudSession.session) || !cloudProof || cloudAge < -60000 || cloudAge>10*60000)fail_('source_connection_required');
+      }
+      properties.setProperty('PLACEMENT_SOURCE_MODE',request.payload.mode);
       return jsonOutput_(sourceStatus_());
     }
     if (request.action === 'configure_monitor') {
@@ -274,7 +304,11 @@ function status_(configuration) {
 }
 function runCheck() {
   var lock=LockService.getScriptLock(); if (!lock.tryLock(1000)) return {ok:false,error:'busy'};
-  try {return runCheckUnlocked_();} finally {lock.releaseLock();}
+  try {
+    var retry=cloudSourceRetry_();
+    if(sourceStatus_().mode==='google_https' && retry && Date.parse(retry.next_attempt_at)>Date.now())return {ok:false,error:'source_retry_wait',next_attempt_at:retry.next_attempt_at};
+    return runCheckUnlocked_();
+  } finally {lock.releaseLock();}
 }
 function runCheckUnlocked_() {
   var configuration, phase='account';
@@ -291,13 +325,19 @@ function runCheckUnlocked_() {
     phase='delivery';
     var result=ingestSnapshot_(snapshot, configuration);
     var state=loadState_();state.failure=null;saveState_(state);
-    try {PropertiesService.getScriptProperties().deleteProperty('SOURCE_FAILURE_JSON');} catch(_) {}
+    try {PropertiesService.getScriptProperties().deleteProperty('SOURCE_FAILURE_JSON');PropertiesService.getScriptProperties().deleteProperty('CLOUD_SOURCE_RETRY_JSON');} catch(_) {}
     return result;
   } catch (error) {
     if(phase==='source') {
       var allowedReasons=['google_quota','tls_failure','network_timeout','network_address_unavailable','network_unreachable','local_checker_stale'];
       var reason=error.placementReconnect?'signin_required':allowedReasons.includes(error.placementFailureReason)?error.placementFailureReason:/stored IITB session is not valid/.test(error.message || '')?'invalid_saved_session':'source_check_failed';
-      try {PropertiesService.getScriptProperties().setProperty('SOURCE_FAILURE_JSON',JSON.stringify({observed_at:new Date().toISOString(),reason:reason}));} catch(_) {}
+      try {
+        PropertiesService.getScriptProperties().setProperty('SOURCE_FAILURE_JSON',JSON.stringify({observed_at:new Date().toISOString(),reason:reason}));
+        if(sourceStatus_().mode==='google_https') {
+          var previousRetry=cloudSourceRetry_(),failures=Math.min(4,(previousRetry?previousRetry.failures:0)+1),delayMinutes=[5,10,30,60][failures-1];
+          PropertiesService.getScriptProperties().setProperty('CLOUD_SOURCE_RETRY_JSON',JSON.stringify({failures:failures,next_attempt_at:new Date(Date.now()+delayMinutes*60000).toISOString()}));
+        }
+      } catch(_) {}
     }
     if(configuration) {
       try {
@@ -383,4 +423,8 @@ function replaceMonitorSchedule_(configuration,minutes,current) {
 function sourceStatus_() {
   var p=PropertiesService.getScriptProperties(),last=p.getProperty('LOCAL_SOURCE_LAST_SUCCESS'),time=Date.parse(last),age=Date.now()-time;
   return {ok:true,mode:p.getProperty('PLACEMENT_SOURCE_MODE')==='local_https'?'local_https':'google_https',local_source_observed_at:isFinite(time)?new Date(time).toISOString():null,local_source_fresh:isFinite(time) && age>=-60000 && age<=15*60000};
+}
+
+function cloudSourceRetry_() {
+  try {var value=JSON.parse(PropertiesService.getScriptProperties().getProperty('CLOUD_SOURCE_RETRY_JSON') || 'null');return value && Number.isInteger(value.failures) && value.failures>=1 && value.failures<=4 && typeof value.next_attempt_at==='string' && isFinite(Date.parse(value.next_attempt_at))?value:null;} catch(_){return null;}
 }

@@ -223,3 +223,34 @@ test('Local network mode requires a fresh signed complete snapshot and never sub
  const reads=h.stats().sourceReads;h.setMode('source_failure');assert.equal(h.context.runCheck().ok,true);assert.equal(h.stats().sourceReads,reads);
  h.advance(16*60000);assert.equal(h.call('source_status').local_source_fresh,false);assert.equal(h.context.runCheck().ok,false);assert.equal(h.stats().notifications,1);assert.equal(h.stats().sourceReads,reads);
 });
+
+test('Direct cloud probe verifies the full source without delivery, mode changes, arbitrary URLs or private response data',()=>{
+ const h=harness();const bad=h.envelope('probe_cloud_source');bad.signature='0'.repeat(64);assert.equal(h.post(bad).error,'authentication_failed');
+ assert.equal(h.call('probe_cloud_source',{url:BLOG}).error,'invalid_payload');assert.equal(h.stats().sourceReads,0);
+ h.properties.set('PLACEMENT_SOURCE_MODE','local_https');const result=h.call('probe_cloud_source');
+ assert.equal(result.reachable,true);assert.equal(result.post_count,1);assert.ok(result.cloud_source_verified_at);assert.equal(h.call('source_status').mode,'local_https');assert.equal(h.values.STATE_FILE_ID.last_successful_check,null);assert.equal(h.stats().created,0);assert.equal(h.stats().notifications,0);
+ assert.doesNotMatch(JSON.stringify(result),/synthetic-cookie|posts|session|source_url/);
+ h.context.readPlacementSource_=()=>{const e=new Error('Private error must not leak');e.placementFailureReason='network_address_unavailable';throw e;};
+ assert.deepEqual(h.call('probe_cloud_source'),{ok:true,reachable:false,reason:'network_address_unavailable',observed_at:new Date(NOW+100).toISOString()});
+ const wrong=harness({effectiveOwner:'other@example.test'});assert.equal(wrong.call('probe_cloud_source').error,'wrong_account');
+});
+test('Returning to Google reading requires recent complete cloud proof and preserves the existing schedule',()=>{
+ const h=harness();h.call('install_monitor');h.properties.set('PLACEMENT_SOURCE_MODE','local_https');
+ assert.equal(h.call('configure_source',{mode:'google_https'}).mode,'google_https');assert.equal(h.stats().created,1);
+ h.properties.set('PLACEMENT_SOURCE_MODE','local_https');h.advance(11*60000);
+ assert.equal(h.call('configure_source',{mode:'google_https'}).error,'source_connection_required');assert.equal(h.call('source_status').mode,'local_https');
+});
+
+test('Explicit cloud restoration moves only the recorded schedule and never reports stale access as working',()=>{
+ const h=harness();h.call('install_monitor');h.properties.set('PLACEMENT_SOURCE_MODE','local_https');h.advance(11*60000);
+ const before=clone(h.values.STATE_FILE_ID);const r=h.call('restore_cloud_monitor');
+ assert.deepEqual(r,{ok:true,mode:'google_https',monitor_interval_minutes:5,source_verified:false,awaiting_cloud_read:true});assert.deepEqual(h.values.STATE_FILE_ID,before);assert.equal(h.stats().created,1);
+ const missing=harness();assert.equal(missing.call('restore_cloud_monitor').error,'monitor_verification_required');
+ const forged=h.envelope('restore_cloud_monitor');forged.signature='0'.repeat(64);assert.equal(h.post(forged).error,'authentication_failed');
+});
+test('Scheduled cloud outages back off without duplicate notices and resume five-minute checks after recovery',()=>{
+ const h=harness();h.call('install_monitor');h.setMode('source_failure');assert.equal(h.context.runCheck().ok,false);const reads=h.stats().sourceReads;
+ assert.equal(h.context.runCheck().error,'source_retry_wait');assert.equal(h.stats().sourceReads,reads);assert.equal(h.stats().notifications,1);
+ h.advance(5*60000);assert.equal(h.context.runCheck().ok,false);assert.equal(h.context.cloudSourceRetry_().failures,2);assert.equal(h.stats().notifications,1);
+ h.advance(10*60000);h.setMode('success');assert.equal(h.context.runCheck().ok,true);assert.equal(h.context.cloudSourceRetry_(),null);assert.equal(h.call('status').last_error,null);
+});

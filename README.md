@@ -1,6 +1,6 @@
 # IITB Placement Watch
 
-A personal placement monitor that runs in Google Apps Script, using its free consumer-account allowance. It checks the official IITB placement blog every 5 minutes, emails new announcements to its configured subscribers, and saves clearly timed future meetings and deadlines to its owner's Google Calendar. If the blog is reachable only on an institute network or VPN, the optional [local HTTPS reader](checker/LOCAL.md) feeds that same Google service from an awake, connected Mac; Google then monitors feed health instead of fetching the source itself.
+A personal placement monitor that runs in Google Apps Script, using its free consumer-account allowance. With source access available, it checks the official IITB placement blog every 5 minutes, emails new announcements to its configured subscribers, and saves clearly timed future meetings and deadlines to its owner's Google Calendar. A schedule does not prove source access. The selected production mode is Google HTTPS; the owner has rejected a Mac dependency. The optional [local HTTPS reader](checker/LOCAL.md) is retained as development code and must not be enabled without a new owner request.
 
 Production uses no paid AI, browser provider or permanent GitHub runner. GitHub stores only generic code, with an optional manually started development-test workflow. The fixture tests can run locally when GitHub execution is unavailable; no payment is needed for the monitor.
 
@@ -11,6 +11,12 @@ For one-time authentication, use the [Chrome connector](chrome-connector/README.
 Sign in on the real IITB website and complete any requested OTP yourself. The explicitly approved connector saves only supported IITB cookies to your private Google storage. Login cookies can grant IITB account access; inspect the connector's consent text before choosing Connect. It never collects your password or OTP, reads profile files, copies HTTP authentication credentials, or monitors in the background. Login files, recipient settings, announcement contents, message IDs and event IDs must not be committed or logged. Forwarded setup ports must remain private.
 
 The production monitor uses authenticated HTTPS requests rather than keeping a browser open. IITB can expire the session or require another OTP; reconnect when that happens. Its acceptance of this cloud session must be tested before enabling the monitor.
+
+## Cloud recovery
+
+The owner can restore the already recorded five-minute Google schedule with signed `restore_cloud_monitor`. This switches the existing source mode to `google_https`, preserves delivery history and reports whether a recent complete cloud read exists. It does not declare an unavailable source healthy or create a second schedule. Signed `probe_cloud_source` tests the complete fixed source from Google without sending announcements or changing source mode. It returns a sanitized access result rather than cookies or blog contents.
+
+During a cloud source outage, the existing trigger stays installed and source attempts back off through 5, 10, 30 and then 60 minutes to conserve the free runtime allowance. A successful source check clears the retry delay and restores the normal five-minute cadence. Unchanged failures send only the existing owner attention notice. Source connectivity, authenticated access and delivery are separate facts: a renewed Chrome login cannot repair a hostname or route unavailable to Google. Do not promise months without intervention when the institute can change access or require reauthentication.
 
 ## Set up the Google monitor
 
